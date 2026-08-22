@@ -29,16 +29,18 @@ jobs:
 
       - name: Sync files
         run: |
-          DEST_DIR="target_repo/Multimodal Risk Fusion and Retrieval-Augmented Clinical Decision Support"
+          DEST_DIR="target_repo/Multimodal Risk Fusion and Retrieval-Augmented Clinical Decision Support/Multimodal Risk Fusion and RAG"
           
-          # Safely create or clean target folder without losing any tracked files in target_repo
-          # Note: We delete the target subfolder first to ensure deleted source files are removed in the destination, 
+          # Safely create or clean target folder without losing other files in the parent directory
+          # Note: We delete ONLY the 'Multimodal Risk Fusion and RAG' subfolder to ensure deleted source files are removed in the destination, 
           # then recreate it and copy the new contents.
           rm -rf "$DEST_DIR"
           mkdir -p "$DEST_DIR"
           
           # Sync all files, excluding .git (git metadata) and .github (workflows) from source to destination
           rsync -av --exclude='.git' --exclude='.github' ./ "$DEST_DIR/"
+
+
 
       - name: Commit and Create Pull Request
         env:
