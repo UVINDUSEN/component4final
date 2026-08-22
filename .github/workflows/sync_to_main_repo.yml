@@ -1,0 +1,73 @@
+name: Sync to Main Repository
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  sync-and-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Clone destination repository
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ -z "$SYNC_PAT" ]; then
+            echo "Error: SYNC_PAT secret is missing. Please set it in your repository secrets."
+            exit 1
+          fi
+          git clone https://x-access-token:${SYNC_PAT}@github.com/dulhara79/R26-DS-012.git target_repo
+
+      - name: Sync files
+        run: |
+          DEST_DIR="target_repo/Multimodal Risk Fusion and Retrieval-Augmented Clinical Decision Support"
+          
+          # Safely create or clean target folder without losing any tracked files in target_repo
+          # Note: We delete the target subfolder first to ensure deleted source files are removed in the destination, 
+          # then recreate it and copy the new contents.
+          rm -rf "$DEST_DIR"
+          mkdir -p "$DEST_DIR"
+          
+          # Sync all files, excluding .git (git metadata) and .github (workflows) from source to destination
+          rsync -av --exclude='.git' --exclude='.github' ./ "$DEST_DIR/"
+
+      - name: Commit and Create Pull Request
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          cd target_repo
+          
+          # Check for changes
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes detected. Skipping PR creation."
+            exit 0
+          fi
+          
+          # Create a unique branch name based on the commit SHA
+          BRANCH_NAME="sync-multimodal-risk-${{ github.sha }}"
+          git checkout -b "$BRANCH_NAME"
+          
+          # Commit the changes
+          git commit -m "Sync multimodal risk fusion and decision support from source repo (commit ${{ github.sha }})"
+          
+          # Push the branch to the remote repository
+          git push origin "$BRANCH_NAME"
+          
+          # Create the pull request using GitHub CLI (gh)
+          gh pr create \
+            --title "Sync: Multimodal Risk Fusion and Clinical Decision Support Updates" \
+            --body "This PR was automatically created by a GitHub Actions workflow to sync updates from the component4final repository. Triggered by commit ${{ github.sha }}." \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --repo dulhara79/R26-DS-012
