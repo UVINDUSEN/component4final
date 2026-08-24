@@ -446,6 +446,7 @@ def call_c3(note_text: str, note_type: str = "progress",
             anxiety_support: Optional[list] = None,
             control_support: Optional[list] = None,
             support_set: Optional[list] = None,
+            support_set_version: Optional[str] = None,
             note_date: Optional[str] = None,
             visit_count: Optional[int] = None,
             subject_external_id: Optional[str] = None,
@@ -500,6 +501,8 @@ def call_c3(note_text: str, note_type: str = "progress",
             request_body["note_date"] = note_date
         if visit_count is not None:
             request_body["visit_count"] = visit_count
+        if support_set_version:
+            request_body["support_set_version"] = support_set_version
         if subject_external_id:
             request_body["subject_id"] = subject_external_id
         used_default_support = False
