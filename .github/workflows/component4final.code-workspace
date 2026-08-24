@@ -2,6 +2,24 @@
 	"folders": [
 		{
 			"path": "../.."
+		},
+		{
+			"path": "../../../component4integration/central_backend"
+		},
+		{
+			"path": "../../../component4integration/data"
+		},
+		{
+			"path": "../../../component4integration/fusion_service"
+		},
+		{
+			"path": "../../../component4integration/guides"
+		},
+		{
+			"path": "../../../component4integration/hf_space"
+		},
+		{
+			"path": "../../../component4integration/notebooks"
 		}
 	],
 	"settings": {}
