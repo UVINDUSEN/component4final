@@ -774,9 +774,13 @@ def doctor_timeline(subject_id: str, limit: int = 20,
                           if k != "gate"} if latest else {},
         "modalities": modality_view,
         "updated_at": latest.computed_at if latest else None,
+        "fusion_result_id": latest.id if latest else None,
+        "modalities_used": latest.modalities_used if latest else 0,
+        "renormalised": bool(latest.renormalised) if latest else False,
         "trend": [{"composite": h.composite, "tier": h.tier, "band": h.band,
                    "computed_at": h.computed_at, "trigger": h.trigger}
                   for h in reversed(history)],
+
         # CARE-X: compact form only. The full explanation (weight provenance,
         # exact counterfactuals, honesty ledger) is on the /explanation endpoint
         # so it is not re-serialised on every timeline poll.
@@ -902,22 +906,28 @@ def doctor_explanation(subject_id: str, db: Session = Depends(get_session),
     explanation["computed_at"] = latest.computed_at
     return explanation
 
+@app.post("/v1/evidence/ask", tags=["egress"])
+def global_evidence(
+    req: EvidenceRequest,
+    db: Session = Depends(get_session),
+    authorization: Optional[str] = Header(None),
+):
+    _auth(authorization)
 
-@app.get("/health", tags=["ops"])
-def health():
-    return {
-        "status": "ok",
-        "version": app.version,
-        "fusion_mode": fusion_client.FUSION_MODE,
-        "components_configured": {m: fn() for m, fn in mc.CONFIGURED.items()},
-        "rag": rag_client.check_rag_health(),
-        "mrn_pepper_set": bool(identity.MRN_PEPPER),
-        "gate": {"min_usable_modalities": gate.MIN_USABLE_MODALITIES,
-                 "excluded": sorted(gate.EXCLUDED_MODALITIES),
-                 "max_age_minutes": gate.MAX_AGE_MINUTES},
-    }
+    result = rag_client.call_rag(req.question)
 
+    _audit(
+        db,
+        None,
+        "rag.global_ask",
+        {
+            "available": result.available,
+            "abstained": result.abstained,
+            "safety_level": result.safety_level,
+            "local_crisis_bypass": getattr(result, "local_crisis_bypass", False),
+            "error": result.error,
+        },
+    )
+    db.commit()
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    return result.to_wire()
