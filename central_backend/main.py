@@ -1,17 +1,3 @@
-"""
-Central Backend — Component 4 · R26-DS-012
-
-Implements the integration sequence diagram end to end.
-
-    ENROLMENT          steps 1-9    identity, pairing, patient separation
-    PASSIVE MODALITIES steps 10-21  physiological / behavioural / contextual
-    CLINICAL MODALITY  steps 22-26  note enters from the clinician side only
-    FUSION             steps 27-31  gate, fuse, persist
-    EGRESS             steps 32-35  two views, one source of truth
-
-Run:  uvicorn main:app --reload --port 8000
-Docs: http://127.0.0.1:8000/docs
-"""
 
 from __future__ import annotations
 
@@ -90,7 +76,10 @@ except Exception as _sb_exc:
 finally:
     try: _sb_db.close()
     except Exception: pass
-
+    
+@app.get("/", tags=["ops"])
+def root():
+    return {"service": "R26-DS-012 Central Backend", "status": "running", "docs": "/docs"}
 
 def _auth(authorization: Optional[str]):
     if API_TOKEN and authorization != f"Bearer {API_TOKEN}":
@@ -931,3 +920,24 @@ def global_evidence(
     db.commit()
 
     return result.to_wire()
+
+
+@app.get("/health", tags=["ops"])
+def health():
+    return {
+        "status": "ok",
+        "version": app.version,
+        "fusion_mode": fusion_client.FUSION_MODE,
+        "components_configured": {m: fn() for m, fn in mc.CONFIGURED.items()},
+        "rag": rag_client.check_rag_health(),
+        "mrn_pepper_set": bool(identity.MRN_PEPPER),
+        "gate": {"min_usable_modalities": gate.MIN_USABLE_MODALITIES,
+                 "excluded": sorted(gate.EXCLUDED_MODALITIES),
+                 "max_age_minutes": gate.MAX_AGE_MINUTES},
+    }
+
+
+if __name__ == "__main__":
+    # pyrefly: ignore [missing-import]
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
