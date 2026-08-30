@@ -53,12 +53,10 @@ class FuseRequest(BaseModel):
 
 
 class ManualComponent(BaseModel):
-    # Every modality score entering fusion is a 0-1 quantity. Bounded, not
-    # clamped: an out-of-range value is a contract violation, not a big number.
-    score: Optional[float] = Field(None, ge=0.0, le=1.0)
+    score: Optional[float] = None
     available: bool = True
-    confidence: float = Field(0.5, ge=0.0, le=1.0)
-    coverage: float = Field(1.0, ge=0.0, le=1.0)
+    confidence: float = 0.5
+    coverage: float = 1.0
     captured_at: Optional[datetime] = None
 
 
@@ -69,19 +67,10 @@ class ManualFuseRequest(BaseModel):
 
 
 class PhysioTick(BaseModel):
-    """C1 minute tick.
-
-    `score` MUST already be the C1 fusion score on the 0-1 scale:
-        max(risk_forecast[+5min], risk_forecast[+10min]) / 100
-    It is NOT current_risk_index and NOT the 0-100 display scale. The bound is
-    enforced here rather than clamped, so a 0-100 value posted by mistake fails
-    loudly with a 422 instead of silently saturating the harmoniser at 1.0.
-    """
     mrn: str
-    score: float = Field(..., ge=0.0, le=1.0,
-                         description="C1 fusion score, 0-1: max(+5,+10 forecast)/100")
-    confidence: float = Field(0.7, ge=0.0, le=1.0)
-    coverage: float = Field(1.0, ge=0.0, le=1.0)
+    score: float
+    confidence: float = 0.7
+    coverage: float = 1.0
     captured_at: Optional[datetime] = None
 
 

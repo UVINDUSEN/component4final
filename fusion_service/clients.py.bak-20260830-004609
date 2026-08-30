@@ -20,7 +20,6 @@ redistributes its weight, and the response says `renormalised: true`.
 from __future__ import annotations
 
 import asyncio
-import math
 import os
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -79,41 +78,6 @@ def to_reading(modality: str, payload: dict) -> Reading:
             body = body[key]
             break
 
-    # ── C1 SPECIAL CASE ──────────────────────────────────────────────────────
-    # The live C1 contract publishes BOTH `score` (current anomaly, 0-1) and
-    # `risk_forecast` (two future values, 0-100). Only the forecast peak enters
-    # fusion:  max(risk_forecast) / 100.  Reading `score` here would silently
-    # fuse the CURRENT anomaly instead of the PREDICTED peak — a different
-    # quantity that happens to be the same shape, which is why the generic
-    # score-hunting loop below must never see a C1 payload first.
-    if modality == "c1_physiological" and "risk_forecast" in body:
-        fc = body.get("risk_forecast")
-        horizons = body.get("forecast_horizons_minutes")
-        if not isinstance(fc, (list, tuple)) or len(fc) != 2:
-            return Reading(available=False,
-                           note=f"C1 risk_forecast must have exactly 2 values, got {fc!r}")
-        try:
-            vals = [float(v) for v in fc]
-        except (TypeError, ValueError):
-            return Reading(available=False, note=f"C1 risk_forecast not numeric: {fc!r}")
-        if not all(math.isfinite(v) and 0.0 <= v <= 100.0 for v in vals):
-            return Reading(available=False,
-                           note=f"C1 risk_forecast values outside 0-100: {vals}")
-        if horizons is not None and [int(h) for h in horizons] != [5, 10]:
-            return Reading(available=False,
-                           note=f"C1 horizons must be [5, 10], got {horizons}")
-        if str(body.get("status", "success")).lower() != "success":
-            return Reading(available=False,
-                           note=f"C1 status={body.get('status')} — no fusable score")
-        return Reading(
-            score=max(vals) / 100.0,
-            available=True,
-            confidence=float(body.get("confidence") or 0.5),
-            coverage=float(body.get("coverage", 1.0)),
-            captured_at=_parse_time(body.get("captured_at")) or datetime.now(timezone.utc),
-            note=f"max({vals[0]},{vals[1]})/100 | {body.get('forecast_model_version')}",
-        )
-
     score = None
     for key in ("score", "risk_score", "value", "probability", "risk"):
         if isinstance(body.get(key), (int, float)):
@@ -121,11 +85,6 @@ def to_reading(modality: str, payload: dict) -> Reading:
             break
     if score is None:
         return Reading(available=False, note=f"no numeric score field in {list(body)[:6]}")
-
-    # Any modality score entering fusion is a 0-1 quantity. Reject, do not clamp.
-    if not math.isfinite(score) or not (0.0 <= score <= 1.0):
-        return Reading(available=False,
-                       note=f"{modality} score {score} outside 0-1 — rejected, not clamped")
 
     available = bool(body.get("available", True))
     return Reading(

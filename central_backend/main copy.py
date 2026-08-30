@@ -1,3 +1,17 @@
+"""
+Central Backend — Component 4 · R26-DS-012
+
+Implements the integration sequence diagram end to end.
+
+    ENROLMENT          steps 1-9    identity, pairing, patient separation
+    PASSIVE MODALITIES steps 10-21  physiological / behavioural / contextual
+    CLINICAL MODALITY  steps 22-26  note enters from the clinician side only
+    FUSION             steps 27-31  gate, fuse, persist
+    EGRESS             steps 32-35  two views, one source of truth
+
+Run:  uvicorn main:app --reload --port 8000
+Docs: http://127.0.0.1:8000/docs
+"""
 
 from __future__ import annotations
 
@@ -49,13 +63,6 @@ async def lifespan(_: FastAPI):
 
 from support_bank import (SupportBankUnavailable, describe_bank,
                           seed_support_bank, select_support_set)
-
-# CARE-X — explanation layer for the fused composite.
-import explain as carex
-_CAREX_THRESHOLDS = carex.load_tier_thresholds()
-_CAREX_REFERENCE_STATUS = carex.load_reference_status()
-_CAREX_BASE_WEIGHTS = carex.load_base_weights()
-
 SUPPORT_BANK_VERSION = __import__("os").getenv("SUPPORT_BANK_VERSION", "synthetic-v1")
 
 
@@ -76,10 +83,7 @@ except Exception as _sb_exc:
 finally:
     try: _sb_db.close()
     except Exception: pass
-    
-@app.get("/", tags=["ops"])
-def root():
-    return {"service": "R26-DS-012 Central Backend", "status": "running", "docs": "/docs"}
+
 
 def _auth(authorization: Optional[str]):
     if API_TOKEN and authorization != f"Bearer {API_TOKEN}":
@@ -263,29 +267,33 @@ def pair_subject(req: PairRequest, db: Session = Depends(get_session)):
     if not clash:
         db.add(SubjectAlias(subject_id=code.subject_id, alias_type="app_user_id",
                             alias_value=req.app_user_id))
-
-    # The patient app and the C1 HF Space use the SAME participant id, so the
-    # pairing value is also the C1 device id. Registering it here means the
-    # backend never queries C1 with an internal subject_id it has never seen.
-    c1_alias = db.scalar(select(SubjectAlias).where(
-        SubjectAlias.subject_id == code.subject_id,
-        SubjectAlias.alias_type == "c1_device_id"))
-    if not c1_alias:
-        db.add(SubjectAlias(subject_id=code.subject_id,
-                            alias_type="c1_device_id",
-                            alias_value=req.app_user_id))
     code.used_at = utcnow()
     _audit(db, code.subject_id, "enrol.paired", {"app_user_id": req.app_user_id})
     db.commit()
     return PairResponse(subject_id=code.subject_id)
 
 
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PATIENT-FIRST ENROLMENT  (added by apply_routes.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ── patient-first enrolment ──────────────────────────────────────────────────
+# The routes above implement CLINICIAN-FIRST enrolment: the clinician creates the
+# subject from an MRN, the backend mints a pairing code, the patient redeems it.
+# That is the right order in a ward where the record exists before the app does.
+#
+# The deployed product runs the other way round. A patient installs AURA at home,
+# registers, and the app mints its own participant id; the clinician meets that
+# id later by scanning a QR. Nothing in the clinician-first flow creates an
+# `app_user_id` alias in that order, so every patient-side ingest resolves to
+# nothing and 404s — the composite then never gets past one modality.
+#
+# These two routes close that gap WITHOUT weakening patient separation:
+#   /v1/subjects/self    AURA claims its own subject at registration.
+#   /v1/subjects/attach  the clinician binds a scanned AURA id to a clinical
+#                        record, joining both identities to ONE subject_id.
+#
+# Both are idempotent, and both refuse rather than merge when an identifier
+# already belongs to someone else. A subject with no `mrn_hash` alias is simply
+# not yet clinician-linked; it is a real subject that can accumulate readings and
+# show the patient their own composite, which is exactly what the product needs
+# between registration and first appointment.
 class SelfEnrolRequest(BaseModel):
     app_user_id: str = Field(..., min_length=4, max_length=128,
                              description="the participant id AURA mints at registration")
@@ -302,7 +310,15 @@ def self_enrol(req: SelfEnrolRequest, db: Session = Depends(get_session),
                authorization: Optional[str] = Header(None)):
     """AURA claims a subject for itself at registration.
 
-    Idempotent: re-calling for a known app_user_id returns the existing subject.
+    Authenticated with the same shared app token as the ingest routes. That is
+    deliberate rather than lax: the patient app already needs that token to POST
+    a single reading, so guarding enrolment more tightly than the ingestion it
+    exists to enable would protect nothing. The shared-secret-in-a-mobile-binary
+    limitation is real and is documented, not hidden.
+
+    Idempotent: calling it again for a known app_user_id returns the existing
+    subject rather than creating a second one, so a reinstall or a retry after a
+    dropped response cannot fork a patient into two records.
     """
     _auth(authorization)
     app_user_id = req.app_user_id.strip()
@@ -343,8 +359,14 @@ class AttachRequest(BaseModel):
 @app.post("/v1/subjects/attach", tags=["enrolment"])
 def attach_subject(req: AttachRequest, db: Session = Depends(get_session),
                    authorization: Optional[str] = Header(None)):
-    """Clinician scans the AURA QR — binds their record to the subject the
-    PATIENT already created, instead of minting a second one."""
+    """Step 4 of the product flow: the clinician scans the AURA QR.
+
+    This binds the clinician's record to the subject the PATIENT already created,
+    instead of minting a second subject that happens to carry the same string as
+    its MRN. That distinction is the whole point: two subjects means the patient's
+    C1/C4 readings and the clinician's C3 note land on different rows and the
+    composite is computed over half the evidence while looking perfectly healthy.
+    """
     _auth(authorization)
     app_user_id = req.app_user_id.strip()
     alias = db.scalar(select(SubjectAlias).where(
@@ -368,6 +390,8 @@ def attach_subject(req: AttachRequest, db: Session = Depends(get_session),
         clash = db.scalar(select(SubjectAlias).where(
             SubjectAlias.alias_type == "mrn_hash", SubjectAlias.alias_value == mrn_hash))
         if clash and clash.subject_id != subject.subject_id:
+            # This MRN is already a different patient. Repointing it would merge
+            # two clinical records, so refuse and let a human resolve it.
             raise HTTPException(409, "that MRN already belongs to a different subject")
         if not clash:
             db.add(SubjectAlias(subject_id=subject.subject_id,
@@ -501,24 +525,8 @@ def ingest_physiological(req: PhysiologicalWindow, db: Session = Depends(get_ses
     row = _store(db, subject_id, "c1_physiological", result)
     db.commit()
     fusion_info = _auto_fuse(db, subject_id, "physio-ingest", debounce=True)
-
-    # Two scales, named so neither can be mistaken for the other:
-    #   c1_fusion_score / composite_score -> 0-1 (canonical, what fusion uses)
-    #   final_risk_score                  -> 0-100 (display only, for the app)
-    fused = fusion_info.get("fusion") or {}
-    composite = fused.get("composite")
     return {"subject_id": subject_id, "reading_id": row.id,
-            "status": result.status,
-            "score": result.raw_score,
-            "c1_fusion_score": result.raw_score,
-            "composite_score": composite,
-            "final_risk_score": (round(composite * 100, 2)
-                                 if composite is not None else None),
-            "tier": fused.get("tier"),
-            "band": fused.get("band"),
-            "scale_note": "c1_fusion_score and composite_score are 0-1; "
-                          "final_risk_score is composite_score*100 for display",
-            "note": result.note,
+            "status": result.status, "score": result.raw_score, "note": result.note,
             **fusion_info}
 
 
@@ -881,10 +889,21 @@ def doctor_timeline(subject_id: str, limit: int = 20,
 
     return {
         "subject_id": subject_id,
+        # fusion_result_id is what POST /v1/verdict keys the clinician's HITL
+        # judgement to. Without it the doctor app can render a composite it can
+        # never record a verdict against, which silently disables the entire
+        # calibration loop — the conformal band edges depend on those labels.
+        "fusion_result_id": latest.id if latest else None,
         "composite": latest.composite if latest else None,
         "tier": latest.tier if latest else None,
         "band": latest.band if latest else "GREY",
         "confidence": round(latest.confidence, 4) if latest else 0.0,
+        # modalities_used and renormalised are the honesty fields: a composite
+        # built from 2 streams with renormalised weights means something
+        # different from one built from 3, and the clinician must be able to see
+        # which they are looking at.
+        "modalities_used": latest.modalities_used if latest else 0,
+        "renormalised": bool(latest.renormalised) if latest else False,
         "reason": latest.reason if latest else "no assessment yet",
         "weights": latest.weights if latest else {},
         "contributions": latest.contributions if latest else {},
@@ -894,20 +913,9 @@ def doctor_timeline(subject_id: str, limit: int = 20,
                           if k != "gate"} if latest else {},
         "modalities": modality_view,
         "updated_at": latest.computed_at if latest else None,
-        "fusion_result_id": latest.id if latest else None,
-        "modalities_used": latest.modalities_used if latest else 0,
-        "renormalised": bool(latest.renormalised) if latest else False,
         "trend": [{"composite": h.composite, "tier": h.tier, "band": h.band,
                    "computed_at": h.computed_at, "trigger": h.trigger}
                   for h in reversed(history)],
-
-        # CARE-X: compact form only. The full explanation (weight provenance,
-        # exact counterfactuals, honesty ledger) is on the /explanation endpoint
-        # so it is not re-serialised on every timeline poll.
-        "explanation": carex.explanation_summary(carex.explain_fusion(
-            _carex_fusion_dict(latest), modality_view,
-            _CAREX_THRESHOLDS, _CAREX_REFERENCE_STATUS,
-            _CAREX_BASE_WEIGHTS)),
     }
 
 
@@ -946,110 +954,29 @@ def doctor_evidence(subject_id: str, req: EvidenceRequest,
     return {"subject_id": subject_id, **result.to_wire()}
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CARE-X — explanation of the fused composite
-# ═════════════════════════════════════════════════════════════════════════════
-def _carex_fusion_dict(row) -> dict:
-    """FusionResult row -> the plain dict CARE-X consumes.
+class GlobalEvidenceRequest(BaseModel):
+    question: str = Field(..., min_length=1)
 
-    Kept as an adapter rather than passing the ORM object so the explainer has
-    no SQLAlchemy dependency and stays unit-testable against fixtures.
-    """
-    if row is None:
-        return {}
-    return {
-        "composite": row.composite,
-        "tier": row.tier,
-        "band": row.band,
-        "confidence": row.confidence,
-        "reason": row.reason,
-        "renormalised": row.renormalised,
-        "weights": row.weights or {},
-        "contributions": row.contributions or {},
-        "harmonisation": row.harmonisation or {},
-    }
-
-
-@app.get("/v1/doctor/patients/{subject_id}/explanation", tags=["egress"])
-def doctor_explanation(subject_id: str, db: Session = Depends(get_session),
-                       authorization: Optional[str] = Header(None)):
-    """Why this composite came out the way it did.
-
-    Reads only the stored fusion result — no component is re-called — so the
-    explanation is reproducible months later, when those Spaces may be gone.
-    Deterministic: the same fusion result always yields the same explanation, or
-    a clinician reopening yesterday's assessment would see a different rationale
-    and stop trusting the number.
-    """
-    _auth(authorization)
-    _require_subject(db, subject_id)
-
-    latest = _latest_fusion(db, subject_id)
-    if latest is None:
-        return {"subject_id": subject_id, "assessed": False,
-                "narrative": "No assessment has been produced for this patient yet. "
-                             "This is an absence of evidence, not a low-risk result.",
-                "explainer_version": carex.EXPLAINER_VERSION}
-
-    readings = _latest_readings(db, subject_id)
-    now = dt.datetime.now(dt.timezone.utc)
-    modality_view = {}
-    for modality in ALL_MODALITIES:
-        r = readings.get(modality)
-        if not r:
-            modality_view[modality] = {"status": "absent", "score": None}
-            continue
-        captured = r["captured_at"]
-        if captured.tzinfo is None:
-            captured = captured.replace(tzinfo=dt.timezone.utc)
-        age_min = (now - captured).total_seconds() / 60.0
-        max_age = gate.MAX_AGE_MINUTES.get(modality)
-        modality_view[modality] = {
-            "status": r["status"], "score": r["raw_score"],
-            "confidence": r["confidence"], "coverage": r["coverage"],
-            "age_minutes": round(age_min, 1),
-            "fresh": (max_age is None) or (age_min <= max_age),
-            "model_version": r["model_version"],
-            "excluded": modality in gate.EXCLUDED_MODALITIES,
-        }
-
-    explanation = carex.explain_fusion(
-        _carex_fusion_dict(latest), modality_view,
-        _CAREX_THRESHOLDS, _CAREX_REFERENCE_STATUS, _CAREX_BASE_WEIGHTS)
-
-    _audit(db, subject_id, "egress.explanation",
-           {"fusion_result_id": latest.id, "explainer": carex.EXPLAINER_VERSION})
-    db.commit()
-
-    explanation["subject_id"] = subject_id
-    explanation["fusion_result_id"] = latest.id
-    explanation["computed_at"] = latest.computed_at
-    return explanation
 
 @app.post("/v1/evidence/ask", tags=["egress"])
-def global_evidence(
-    req: EvidenceRequest,
-    db: Session = Depends(get_session),
-    authorization: Optional[str] = Header(None),
-):
+def evidence_ask(req: GlobalEvidenceRequest, db: Session = Depends(get_session),
+                 authorization: Optional[str] = Header(None)):
+    """Knowledge-base question with no patient selected — backs the Ask CARE tab.
+
+    The clinician app has called this path all along; it did not exist here, so
+    the whole tab returned 404 and reported it as "CARE-AnxRAG unavailable",
+    which is indistinguishable from the service actually being down. Same RAG
+    call as the per-patient route, minus the subject scoping, and audited
+    against no subject because there is none.
+    """
     _auth(authorization)
-
     result = rag_client.call_rag(req.question)
-
-    _audit(
-        db,
-        None,
-        "rag.global_ask",
-        {
-            "available": result.available,
-            "abstained": result.abstained,
+    _audit(db, None, "rag.evidence.global",
+           {"available": result.available, "abstained": result.abstained,
             "safety_level": result.safety_level,
-            "local_crisis_bypass": getattr(result, "local_crisis_bypass", False),
-            "error": result.error,
-        },
-    )
+            "local_crisis_bypass": result.local_crisis_bypass,
+            "error": result.error})
     db.commit()
-
     return result.to_wire()
 
 
@@ -1069,6 +996,5 @@ def health():
 
 
 if __name__ == "__main__":
-    # pyrefly: ignore [missing-import]
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))

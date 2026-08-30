@@ -753,8 +753,12 @@ from db_models import SessionLocal as _SL  # noqa: E402
 db = _SL()
 check("backend resolves our UUID to C2's own id",
       main._external_id(db, P1, "c2_behavioral") == "P_65DC4002E7863773")
-check("unmapped modality falls back to our subject_id",
-      main._external_id(db, P1, "c1_physiological") == P1)
+# C1 is auto-registered at pairing time (patient app and C1 Space share the
+# participant id), so it must resolve to the paired app_user_id, NOT our UUID.
+check("c1 resolves to the paired app_user_id, not our internal UUID",
+      main._external_id(db, P1, "c1_physiological") == "phone-aaa")
+check("genuinely unmapped modality still falls back to our subject_id",
+      main._external_id(db, P1, "c3_clinical_nlp") == P1)
 db.close()
 
 check("re-registering updates rather than duplicating",

@@ -263,125 +263,10 @@ def pair_subject(req: PairRequest, db: Session = Depends(get_session)):
     if not clash:
         db.add(SubjectAlias(subject_id=code.subject_id, alias_type="app_user_id",
                             alias_value=req.app_user_id))
-
-    # The patient app and the C1 HF Space use the SAME participant id, so the
-    # pairing value is also the C1 device id. Registering it here means the
-    # backend never queries C1 with an internal subject_id it has never seen.
-    c1_alias = db.scalar(select(SubjectAlias).where(
-        SubjectAlias.subject_id == code.subject_id,
-        SubjectAlias.alias_type == "c1_device_id"))
-    if not c1_alias:
-        db.add(SubjectAlias(subject_id=code.subject_id,
-                            alias_type="c1_device_id",
-                            alias_value=req.app_user_id))
     code.used_at = utcnow()
     _audit(db, code.subject_id, "enrol.paired", {"app_user_id": req.app_user_id})
     db.commit()
     return PairResponse(subject_id=code.subject_id)
-
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PATIENT-FIRST ENROLMENT  (added by apply_routes.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class SelfEnrolRequest(BaseModel):
-    app_user_id: str = Field(..., min_length=4, max_length=128,
-                             description="the participant id AURA mints at registration")
-
-
-class SelfEnrolResponse(BaseModel):
-    subject_id: str
-    created: bool
-    clinician_linked: bool
-
-
-@app.post("/v1/subjects/self", response_model=SelfEnrolResponse, tags=["enrolment"])
-def self_enrol(req: SelfEnrolRequest, db: Session = Depends(get_session),
-               authorization: Optional[str] = Header(None)):
-    """AURA claims a subject for itself at registration.
-
-    Idempotent: re-calling for a known app_user_id returns the existing subject.
-    """
-    _auth(authorization)
-    app_user_id = req.app_user_id.strip()
-    if not app_user_id:
-        raise HTTPException(422, "app_user_id must not be blank")
-
-    existing = db.scalar(select(SubjectAlias).where(
-        SubjectAlias.alias_type == "app_user_id",
-        SubjectAlias.alias_value == app_user_id))
-
-    if existing:
-        subject = db.get(Subject, existing.subject_id)
-        if subject is None or subject.status != "active":
-            raise HTTPException(409, "that participant id belongs to an inactive subject")
-        linked = db.scalar(select(SubjectAlias).where(
-            SubjectAlias.subject_id == existing.subject_id,
-            SubjectAlias.alias_type == "mrn_hash")) is not None
-        _audit(db, existing.subject_id, "enrol.self.repeat", {"app_user_id": app_user_id})
-        db.commit()
-        return SelfEnrolResponse(subject_id=existing.subject_id, created=False,
-                                 clinician_linked=linked)
-
-    subject_id = identity.new_subject_id()
-    db.add(Subject(subject_id=subject_id, enrolled_by="aura-self"))
-    db.add(SubjectAlias(subject_id=subject_id, alias_type="app_user_id",
-                        alias_value=app_user_id))
-    _audit(db, subject_id, "enrol.self.created", {"app_user_id": app_user_id})
-    db.commit()
-    return SelfEnrolResponse(subject_id=subject_id, created=True, clinician_linked=False)
-
-
-class AttachRequest(BaseModel):
-    app_user_id: str = Field(..., description="the id decoded from the AURA QR")
-    mrn: Optional[str] = Field(None, description="ward MRN, if the clinician has one")
-    enrolled_by: Optional[str] = None
-
-
-@app.post("/v1/subjects/attach", tags=["enrolment"])
-def attach_subject(req: AttachRequest, db: Session = Depends(get_session),
-                   authorization: Optional[str] = Header(None)):
-    """Clinician scans the AURA QR — binds their record to the subject the
-    PATIENT already created, instead of minting a second one."""
-    _auth(authorization)
-    app_user_id = req.app_user_id.strip()
-    alias = db.scalar(select(SubjectAlias).where(
-        SubjectAlias.alias_type == "app_user_id",
-        SubjectAlias.alias_value == app_user_id))
-    if not alias:
-        raise HTTPException(404, "no AURA registration for that participant id — "
-                                 "ask the patient to open Aura and complete sign-up")
-
-    subject = _require_subject(db, alias.subject_id)
-
-    mrn_linked = False
-    if req.mrn:
-        try:
-            mrn_hash = identity.hash_mrn(req.mrn)
-        except identity.PepperNotConfigured as exc:
-            raise HTTPException(500, str(exc))
-        except ValueError as exc:
-            raise HTTPException(422, str(exc))
-
-        clash = db.scalar(select(SubjectAlias).where(
-            SubjectAlias.alias_type == "mrn_hash", SubjectAlias.alias_value == mrn_hash))
-        if clash and clash.subject_id != subject.subject_id:
-            raise HTTPException(409, "that MRN already belongs to a different subject")
-        if not clash:
-            db.add(SubjectAlias(subject_id=subject.subject_id,
-                                alias_type="mrn_hash", alias_value=mrn_hash))
-        mrn_linked = True
-
-    if req.enrolled_by and subject.enrolled_by in (None, "", "aura-self"):
-        subject.enrolled_by = req.enrolled_by
-
-    _audit(db, subject.subject_id, "enrol.attached",
-           {"app_user_id": app_user_id, "mrn_linked": mrn_linked}, req.enrolled_by)
-    db.commit()
-    return {"subject_id": subject.subject_id, "app_user_id": app_user_id,
-            "mrn_linked": mrn_linked, "clinician_linked": True}
 
 
 @app.get("/v1/subjects/resolve", tags=["enrolment"])
@@ -501,24 +386,8 @@ def ingest_physiological(req: PhysiologicalWindow, db: Session = Depends(get_ses
     row = _store(db, subject_id, "c1_physiological", result)
     db.commit()
     fusion_info = _auto_fuse(db, subject_id, "physio-ingest", debounce=True)
-
-    # Two scales, named so neither can be mistaken for the other:
-    #   c1_fusion_score / composite_score -> 0-1 (canonical, what fusion uses)
-    #   final_risk_score                  -> 0-100 (display only, for the app)
-    fused = fusion_info.get("fusion") or {}
-    composite = fused.get("composite")
     return {"subject_id": subject_id, "reading_id": row.id,
-            "status": result.status,
-            "score": result.raw_score,
-            "c1_fusion_score": result.raw_score,
-            "composite_score": composite,
-            "final_risk_score": (round(composite * 100, 2)
-                                 if composite is not None else None),
-            "tier": fused.get("tier"),
-            "band": fused.get("band"),
-            "scale_note": "c1_fusion_score and composite_score are 0-1; "
-                          "final_risk_score is composite_score*100 for display",
-            "note": result.note,
+            "status": result.status, "score": result.raw_score, "note": result.note,
             **fusion_info}
 
 
