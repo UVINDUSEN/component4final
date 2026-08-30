@@ -191,6 +191,59 @@ class EnrolResponse(BaseModel):
     expires_at: dt.datetime
 
 
+class SelfEnrolRequest(BaseModel):
+    app_user_id: str = Field(..., pattern=r"^P_[A-F0-9]{16}$")
+
+
+class SelfEnrolResponse(BaseModel):
+    subject_id: str
+
+
+@app.post("/v1/subjects/self", response_model=SelfEnrolResponse, tags=["enrolment"])
+def self_enrol_subject(req: SelfEnrolRequest, db: Session = Depends(get_session)):
+    """Register an Aura participant before the clinician scans their QR.
+
+    The QR value is also the identifier the clinician app submits as its MRN,
+    so both aliases must point to the same central subject. Repeated calls are
+    idempotent, including when the clinician enrolled the participant first.
+    """
+    try:
+        mrn_hash = identity.hash_mrn(req.app_user_id)
+    except identity.PepperNotConfigured as exc:
+        raise HTTPException(500, str(exc))
+
+    app_alias = db.scalar(select(SubjectAlias).where(
+        SubjectAlias.alias_type == "app_user_id",
+        SubjectAlias.alias_value == req.app_user_id))
+    mrn_alias = db.scalar(select(SubjectAlias).where(
+        SubjectAlias.alias_type == "mrn_hash",
+        SubjectAlias.alias_value == mrn_hash))
+
+    if app_alias and mrn_alias and app_alias.subject_id != mrn_alias.subject_id:
+        raise HTTPException(409, "participant ID is already linked to different subjects")
+
+    existing = app_alias or mrn_alias
+    if existing:
+        subject_id = existing.subject_id
+        _require_subject(db, subject_id)
+        event = "enrol.self.repeat"
+    else:
+        subject_id = identity.new_subject_id()
+        db.add(Subject(subject_id=subject_id))
+        event = "enrol.self.created"
+
+    if not app_alias:
+        db.add(SubjectAlias(subject_id=subject_id, alias_type="app_user_id",
+                            alias_value=req.app_user_id))
+    if not mrn_alias:
+        db.add(SubjectAlias(subject_id=subject_id, alias_type="mrn_hash",
+                            alias_value=mrn_hash))
+
+    _audit(db, subject_id, event, {"alias": "app_user_id"})
+    db.commit()
+    return SelfEnrolResponse(subject_id=subject_id)
+
+
 @app.post("/v1/subjects", response_model=EnrolResponse, tags=["enrolment"])
 def enrol_subject(req: EnrolRequest, db: Session = Depends(get_session),
                   authorization: Optional[str] = Header(None)):
