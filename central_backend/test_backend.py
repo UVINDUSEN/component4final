@@ -104,6 +104,7 @@ def stub_c4(subject_id, demographics, client=None):
                               coverage=1.0, model_version="dcar-v1.0")
 
 
+_real_call_c1 = mc.call_c1
 mc.call_c1, mc.call_c2, mc.call_c3, mc.call_c4 = stub_c1, stub_c2, stub_c3, stub_c4
 import main  # noqa: E402
 main.mc.call_c1, main.mc.call_c2, main.mc.call_c3, main.mc.call_c4 = (
@@ -741,6 +742,82 @@ check("MISMATCHED subject echo is caught",
       "SUBJECT MISMATCH" in (mc.verify_subject_echo("P_123", "P_999", "C2") or ""))
 check("absent echo is tolerated (not all services echo)",
       mc.verify_subject_echo("P_123", None, "C2") is None)
+
+# ── C1: live service is GET /predict/{participant_id}, with no feature body ──
+class _C1Response:
+    status_code = 200
+
+    @staticmethod
+    def json():
+        return {
+            "status": "success",
+            "message": "Personalized physiological forecast ready.",
+            "forecast": [0.21] * 10,
+            "adjusted_error_forecast": [0.24] * 10,
+            "risk_forecast": [37.5] * 10,
+            "current_reconstruction_error": 0.24,
+            "current_risk_index": 37.5,
+            "reconstruction_error_threshold": 0.25,
+            "latest_reading_at": "2026-08-30T12:00:00+00:00",
+            "latest_reading_age_seconds": 20.0,
+        }
+
+
+class _C1Client:
+    def __init__(self):
+        self.get_urls = []
+        self.post_urls = []
+
+    def get(self, url, **_kwargs):
+        self.get_urls.append(url)
+        return _C1Response()
+
+    def post(self, url, **_kwargs):
+        self.post_urls.append(url)
+        raise AssertionError("the live C1 prediction endpoint does not accept POST")
+
+
+_old_c1_base = mc.C1_BASE
+mc.C1_BASE = "https://c1.example"
+_c1_client = _C1Client()
+_c1_result = _real_call_c1(
+    "P_ABCDEF0123456789",
+    window={"features": {"mean_hr": 99.0, "sdnn": 0.0, "rmssd": 0.0}},
+    client=_c1_client,
+)
+mc.C1_BASE = _old_c1_base
+check("C1 prediction uses GET /predict/{participant_id}",
+      _c1_client.get_urls == ["https://c1.example/predict/P_ABCDEF0123456789"])
+check("C1 prediction never POSTs incomplete feature data", not _c1_client.post_urls)
+check("C1 current_risk_index is parsed from the live response",
+      _c1_result.status == "ok" and _c1_result.raw_score == 37.5)
+
+# The central ingest endpoint must prefer the patient app's P_ id over our UUID
+# and must not pass the old three-value pseudo-window into the C1 client.
+_seen_c1_call = {}
+_original_c1_call = main.mc.call_c1
+
+
+def _capture_c1_call(user_id, window=None, client=None):
+    _seen_c1_call.update({"user_id": user_id, "window": window})
+    return mc.ComponentResult(raw_score=37.5, status="ok", confidence=0.5,
+                              coverage=0.5)
+
+
+main.mc.call_c1 = _capture_c1_call
+_c1_participant = "P_ABCDEF0123456789"
+client.post("/v1/subjects/self", json={"app_user_id": _c1_participant})
+_c1_ingest = client.post("/v1/ingest/physiological", json={
+    "app_user_id": _c1_participant,
+    "features": {"mean_hr": 99.0, "sdnn": 0.0, "rmssd": 0.0},
+})
+main.mc.call_c1 = _original_c1_call
+check("central physiological ingest accepts the patient notification",
+      _c1_ingest.status_code == 200, _c1_ingest.text)
+check("central physiological ingest calls C1 with the P_ participant id",
+      _seen_c1_call.get("user_id") == _c1_participant, str(_seen_c1_call))
+check("central physiological ingest does not forward pseudo-features",
+      _seen_c1_call.get("window") is None, str(_seen_c1_call))
 
 # ── C2: the experimental score must NEVER become the fused score ─────────────
 r = client.post("/v1/ingest/behavioural", json={
