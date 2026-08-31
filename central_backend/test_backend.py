@@ -81,9 +81,26 @@ def stub_c3(note_text, note_type="progress", anxiety_support=None,
                                   note="no_support_set (support_k=0)")
     # mirrors the REAL C3 response: entropy present, so confidence is derived
     # from it rather than from C3's own score-shaped `confidence` field
+    detail = {
+        "subject_id": subject_external_id,
+        "modality": "c3_clinical_nlp",
+        "score": _C3_SCORE[0],
+        "status": "ok",
+        "probability": _C3_SCORE[0],
+        "calibration_status": "uncalibrated",
+        "entropy": 0.6331,
+        "support_k": _C3_SUPPORT_K[0],
+        "support_contributions": [
+            {"id": "anx-1", "label": "anxiety", "weight": 0.5},
+            {"id": "ctl-1", "label": "control", "weight": 0.5},
+        ],
+    }
     return mc.ComponentResult(raw_score=_C3_SCORE[0], status="ok",
                               confidence=mc.confidence_from_entropy(0.6331) or 0.5,
-                              coverage=1.0, model_version="TC-WPN-v1.0")
+                              coverage=1.0, model_version="TC-WPN-v1.0",
+                              detail=detail,
+                              note="probability (calibration_status=uncalibrated); "
+                                   "confidence: entropy-derived")
 
 
 def stub_c2(subject_external_id, payload=None, client=None):
@@ -242,6 +259,16 @@ r = client.post("/v1/clinical-notes", json={
     "subject_id": P1, "note_text": "Patient reports persistent worry, poor sleep, "
     "and restlessness over the past two weeks.", "note_type": "progress"})
 check("clinical note ingest 200", r.status_code == 200, r.text)
+clinical_payload = r.json()
+check("clinical response returns the C3 detail consumed by the doctor app",
+      clinical_payload.get("component_detail", {}).get("probability") == 0.68 and
+      clinical_payload.get("component_detail", {}).get("entropy") == 0.6331 and
+      len(clinical_payload.get("component_detail", {}).get("support_contributions", [])) == 2,
+      str(clinical_payload))
+check("clinical response identifies the C3 score provenance",
+      clinical_payload.get("score_provenance") ==
+      "probability (calibration_status=uncalibrated); confidence: entropy-derived",
+      str(clinical_payload))
 
 r = client.post("/v1/fusion/run", json={"subject_id": P1, "trigger": "note"})
 res = r.json()
