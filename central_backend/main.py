@@ -564,6 +564,8 @@ def ingest_clinical_note(req: ClinicalNote, db: Session = Depends(get_session),
     fusion_info = _auto_fuse(db, subject_id, "note-ingest")
     return {"subject_id": subject_id, "reading_id": row.id,
             "status": result.status, "score": result.raw_score, "note": result.note,
+            "component_detail": result.detail,
+            "score_provenance": result.note,
             **fusion_info}
 
 
