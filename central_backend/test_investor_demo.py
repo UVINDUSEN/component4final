@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import importlib
 import os
-import sys
 import tempfile
 
 _tmpdb = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -46,17 +44,20 @@ def stub_c4(subject_id, demographics, client=None):
     )
 
 
+# Install deterministic external-service doubles BEFORE importing main_demo.
+# main_demo captures the original C3 function so disabling the flag can prove
+# that the normal C3 path is restored.
 mc.call_c1 = stub_c1
 mc.call_c3 = stub_c3
 mc.call_c4 = stub_c4
 
-import main  # noqa: E402
+import main as core  # noqa: E402
+import main_demo as demo  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-main.mc.call_c1 = stub_c1
-main.mc.call_c3 = stub_c3
-main.mc.call_c4 = stub_c4
-client = TestClient(main.app)
+core.mc.call_c1 = stub_c1
+core.mc.call_c4 = stub_c4
+client = TestClient(demo.app)
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -109,14 +110,28 @@ neutral = client.post("/v1/clinical-notes", json={
 }).json()
 check("neutral note score", neutral["score"] == 0.4967, str(neutral))
 
+# Every note-triggered fusion still mirrors physiology rather than allowing the
+# simulated clinical score to change the investor-demo final score.
+pat_after_notes = client.get(f"/v1/patients/{subject_id}/risk").json()
+doc_after_notes = client.get(f"/v1/doctor/patients/{subject_id}/timeline").json()
+check(
+    "clinical note does not change demo fusion source",
+    pat_after_notes["composite"] == doc_after_notes["composite"] == 0.8967,
+    f"pat={pat_after_notes} doc={doc_after_notes}",
+)
+
 # Turning the flag off must restore the normal code path.
 os.environ["INVESTOR_DEMO_SIMULATION"] = "0"
-main.INVESTOR_DEMO_SIMULATION = False
 try:
     client.post("/v1/clinical-notes", json={
         "subject_id": subject_id,
         "note_text": "High anxiety should now use the real C3 path.",
-        "support_set": [{"id": "x", "text": "example", "label": "anxiety", "note_date": "2026-01-01"}],
+        "support_set": [{
+            "id": "x",
+            "text": "example",
+            "label": "anxiety",
+            "note_date": "2026-01-01",
+        }],
     })
 except AssertionError:
     pass
