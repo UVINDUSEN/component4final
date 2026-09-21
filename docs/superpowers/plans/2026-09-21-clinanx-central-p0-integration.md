@@ -176,7 +176,8 @@ Work on a new branch from `UVINDUSEN/component4final/main`, suggested name `feat
 - Create: `central_backend/tests/test_attention_event_api.py`
 
 **Interfaces:**
-- Produces all six frozen event operations with `{"events":[...]}` and `{"event":{...}}` envelopes.
+- Produces `GET /v1/attention-events`, `GET /v1/attention-events?status=OPEN`, `GET /v1/attention-events?subject_id={subject_id}`, `GET /v1/attention-events/{event_id}`, `POST /v1/attention-events/{event_id}/acknowledge`, and `POST /v1/attention-events/{event_id}/resolve`.
+- List responses use `{"events":[...]}`; detail and lifecycle mutations use `{"event":{...}}`.
 
 - [ ] Write tests for status/subject filters, detail, empty-body ACK, empty-body RESOLVE, actor/time from JWT, assignment scoping on guessed IDs, invalid status `422`, missing event `404`, and concurrent state conflicts `409`.
 - [ ] Confirm route failures.
