@@ -41,6 +41,11 @@ class RagClientContractTests(unittest.TestCase):
         )
         self.assertFalse(rag_client.local_crisis_prescreen("I am not suicidal"))
         self.assertTrue(rag_client.local_crisis_prescreen("I want to kill myself"))
+        self.assertTrue(
+            rag_client.local_crisis_prescreen(
+                "patient mentioned wanting to end his life"
+            )
+        )
 
     def test_call_rag_preserves_current_care_wire_contract(self):
         payload = {

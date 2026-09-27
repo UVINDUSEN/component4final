@@ -64,6 +64,8 @@ RAG_TIMEOUT_S = float(os.getenv("RAG_TIMEOUT_S", "60"))
 _CRISIS_PATTERNS = [
     r"\bkill myself\b",
     r"\bend my life\b",
+    r"\b(?:wanting|wants?|plans?|intends?|going) to end (?:his|her|their) life\b",
+    r"\b(?:wanting|wants?|plans?|intends?|going) to kill (?:himself|herself|themselves)\b",
     r"\bi(?:'m| am| feel| have been)?\s+suicidal\b",
     r"\bmy suicidal (?:thoughts|plan|intent)\b",
     r"\b(?:want|plan|intend|going) to (?:die|kill myself|end my life)\b",
