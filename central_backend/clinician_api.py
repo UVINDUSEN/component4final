@@ -69,16 +69,25 @@ def require_clinician(authorization: Optional[str] = Header(None), db: Session =
             audience=audience,
             options={"require": ["sub", "clinician_id", "iat", "exp", "jti"]},
         )
-    except jwt.PyJWTError:
+        for name in ("sub", "clinician_id", "jti"):
+            if not isinstance(claims[name], str) or not claims[name].strip():
+                raise jwt.InvalidTokenError(f"{name} must be a non-empty string")
+        for name in ("iat", "exp"):
+            if isinstance(claims[name], bool) or not isinstance(
+                claims[name], (int, float)
+            ):
+                raise jwt.InvalidTokenError(f"{name} must be a numeric date")
+        expires_at = dt.datetime.fromtimestamp(claims["exp"], dt.timezone.utc)
+    except (jwt.PyJWTError, OSError, OverflowError, TypeError, ValueError):
         raise HTTPException(401, "invalid or expired bearer token")
-    clinician = db.get(Clinician, claims.get("clinician_id"))
+    clinician = db.get(Clinician, claims["clinician_id"])
     if not clinician or not clinician.active or claims.get("sub") != clinician.clinician_id:
         raise HTTPException(401, "invalid clinician principal")
     if clinician.role.lower() not in {"clinician", "doctor"}:
         raise HTTPException(403, "principal does not have a clinician role")
     return Principal(clinician_id=clinician.clinician_id, display_name=clinician.display_name,
                      role=clinician.role, token_id=claims["jti"],
-                     expires_at=dt.datetime.fromtimestamp(claims["exp"], dt.timezone.utc))
+                     expires_at=expires_at)
 
 
 def service_or_clinician(authorization: Optional[str] = Header(None), db: Session = Depends(get_session)) -> Optional[Principal]:
@@ -180,10 +189,12 @@ def _forecast_wire(f):
 def _assessment_wire(db: Session, subject_id: str, row: Optional[FusionResult],
                      as_of: Optional[dt.datetime] = None):
     as_of = as_of or utcnow()
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=dt.timezone.utc)
     readings = db.scalars(select(ModalityReading).where(ModalityReading.subject_id == subject_id,
                          ModalityReading.captured_at <= as_of)
                          .order_by(ModalityReading.captured_at.desc(), ModalityReading.id.desc())).all()
-    latest = {}; now = utcnow()
+    latest = {}; now = as_of
     for r in readings: latest.setdefault(r.modality, r)
     modalities = []
     for name in ALL_MODALITIES:
