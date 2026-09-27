@@ -117,6 +117,15 @@ def test_patient_and_clinician_views_share_authoritative_fusion_identity():
 
 def test_patient_and_clinician_views_share_unavailable_state():
     seed()
+    with SessionLocal() as db:
+        db.add(
+            ClinicianSubjectAssignment(
+                clinician_id="DR001",
+                subject_id="patient-b",
+            )
+        )
+        db.commit()
+
     client = TestClient(app)
     headers = auth(client)
 
@@ -127,9 +136,13 @@ def test_patient_and_clinician_views_share_unavailable_state():
     )
 
     assert patient.status_code == 200
-    assert clinician.status_code == 403
-    # patient-b is intentionally not assigned to DR001: the patient can read
-    # its own public prototype risk view while the clinician is denied.
-    assert patient.json()["fusion_result_id"] is None
-    assert patient.json()["composite"] is None
-    assert patient.json()["band"] == "GREY"
+    assert clinician.status_code == 200
+    patient_body = patient.json()
+    clinician_body = clinician.json()
+
+    assert patient_body["fusion_result_id"] is None
+    assert clinician_body["fusion_result_id"] is None
+    assert patient_body["composite"] is None
+    assert clinician_body["current_assessment"] is None
+    assert patient_body["band"] == "GREY"
+    assert clinician_body["assessment_status"] == "unavailable"
