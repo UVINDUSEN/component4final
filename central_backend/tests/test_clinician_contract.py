@@ -3,20 +3,24 @@ import os
 
 os.environ.setdefault("CLINICIAN_JWT_SECRET", "test-secret-that-is-long-enough-for-tests")
 
+import jwt
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from clinician_api import hash_password
 from db_models import (AttentionEvent, Clinician, ClinicianSubjectAssignment,
-                       ForecastResult, FusionResult, SessionLocal, Subject, init_db, utcnow)
+                       EscalationEpisode, ForecastResult, FusionResult,
+                       ModalityReading, SessionLocal, Subject, init_db, utcnow)
+from forecast import persist_c1_forecast_and_event
 from main import app
 
 
 def setup_function():
     init_db()
     with SessionLocal() as db:
-        for model in (AttentionEvent, ForecastResult, ClinicianSubjectAssignment,
-                      FusionResult, Clinician, Subject):
+        for model in (AttentionEvent, EscalationEpisode, ForecastResult,
+                      ClinicianSubjectAssignment, FusionResult, ModalityReading,
+                      Clinician, Subject):
             db.execute(delete(model))
         db.commit()
 
@@ -42,10 +46,13 @@ def seed():
         db.commit()
 
 
-def auth(client):
-    response = client.post("/auth/login", json={"clinician_id": "DR001", "password": "secret"})
+def auth(client, clinician_id="DR001"):
+    response = client.post(
+        "/auth/login",
+        json={"clinician_id": clinician_id, "password": "secret"},
+    )
     assert response.status_code == 200
-    assert response.json()["clinician"]["clinician_id"] == "DR001"
+    assert response.json()["clinician"]["clinician_id"] == clinician_id
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
@@ -92,6 +99,197 @@ def test_non_clinician_role_cannot_use_clinician_api():
     client = TestClient(app)
     login = client.post("/auth/login", json={"clinician_id": "ADMIN1", "password": "secret"})
     assert login.status_code == 403
+
+
+def test_signed_token_missing_required_claim_is_401():
+    seed()
+    now = dt.datetime.now(dt.timezone.utc)
+    token = jwt.encode(
+        {
+            "sub": "DR001",
+            "clinician_id": "DR001",
+            "role": "clinician",
+            "iss": "r26-central-backend",
+            "aud": "clinanx",
+            "iat": int(now.timestamp()),
+            "exp": int((now + dt.timedelta(minutes=5)).timestamp()),
+            # A token without jti is not a valid clinician session.
+        },
+        os.environ["CLINICIAN_JWT_SECRET"],
+        algorithm="HS256",
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get(
+        "/v1/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_attention_event_access_is_assignment_scoped():
+    seed()
+    with SessionLocal() as db:
+        db.add(
+            Clinician(
+                clinician_id="DR002",
+                display_name="Dr Y",
+                role="clinician",
+                password_hash=hash_password("secret"),
+            )
+        )
+        db.commit()
+
+    client = TestClient(app)
+    headers = auth(client, "DR002")
+
+    assert client.get("/v1/attention-events", headers=headers).json() == {"events": []}
+    assert client.get(
+        "/v1/attention-events?subject_id=patient-a",
+        headers=headers,
+    ).status_code == 403
+    assert client.get(
+        "/v1/attention-events/evt_test",
+        headers=headers,
+    ).status_code == 403
+    assert client.post(
+        "/v1/attention-events/evt_test/acknowledge",
+        headers=headers,
+        json={},
+    ).status_code == 403
+    assert client.post(
+        "/v1/attention-events/evt_test/resolve",
+        headers=headers,
+        json={},
+    ).status_code == 403
+
+    with SessionLocal() as db:
+        assert db.get(AttentionEvent, "evt_test").status == "OPEN"
+
+
+def test_attention_lifecycle_persists_and_conflicting_clients_lose():
+    seed()
+    with SessionLocal() as db:
+        db.add(
+            Clinician(
+                clinician_id="DR002",
+                display_name="Dr Y",
+                role="clinician",
+                password_hash=hash_password("secret"),
+            )
+        )
+        db.add(
+            ClinicianSubjectAssignment(
+                clinician_id="DR002",
+                subject_id="patient-a",
+            )
+        )
+        db.commit()
+
+    first_client = TestClient(app)
+    second_client = TestClient(app)
+    first_headers = auth(first_client, "DR001")
+    second_headers = auth(second_client, "DR002")
+
+    acknowledged = first_client.post(
+        "/v1/attention-events/evt_test/acknowledge",
+        headers=first_headers,
+        json={},
+    )
+    conflict = second_client.post(
+        "/v1/attention-events/evt_test/acknowledge",
+        headers=second_headers,
+        json={},
+    )
+
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["event"]["acknowledged_by"] == "DR001"
+    assert conflict.status_code == 409
+
+    with SessionLocal() as fresh_db_session:
+        persisted = fresh_db_session.get(AttentionEvent, "evt_test")
+        assert persisted.status == "ACKNOWLEDGED"
+        assert persisted.acknowledged_by == "DR001"
+        assert persisted.acknowledged_at is not None
+
+    resolved = second_client.post(
+        "/v1/attention-events/evt_test/resolve",
+        headers=second_headers,
+        json={},
+    )
+    stale_resolve = first_client.post(
+        "/v1/attention-events/evt_test/resolve",
+        headers=first_headers,
+        json={},
+    )
+
+    assert resolved.status_code == 200
+    assert resolved.json()["event"]["resolved_by"] == "DR002"
+    assert stale_resolve.status_code == 409
+
+    with SessionLocal() as fresh_db_session:
+        persisted = fresh_db_session.get(AttentionEvent, "evt_test")
+        assert persisted.status == "RESOLVED"
+        assert persisted.resolved_by == "DR002"
+        assert persisted.resolved_at is not None
+
+
+def test_confirmed_forecast_episode_creates_one_attention_event():
+    seed()
+    now = utcnow()
+
+    def reading(db):
+        row = ModalityReading(
+            subject_id="patient-b",
+            modality="c1_physiological",
+            raw_score=.50,
+            status="ok",
+            confidence=.80,
+            coverage=1.0,
+            captured_at=utcnow(),
+            model_version="c1-test",
+            detail={"response": {"risk_forecast": [.50] * 9 + [.80]}},
+        )
+        db.add(row)
+        db.flush()
+        return row
+
+    with SessionLocal() as db:
+        first_forecast, first_event = persist_c1_forecast_and_event(
+            db,
+            "patient-b",
+            reading(db),
+        )
+        first_forecast.generated_at = now - dt.timedelta(seconds=30)
+        db.commit()
+        assert first_event is None
+
+        _, confirmed_event = persist_c1_forecast_and_event(
+            db,
+            "patient-b",
+            reading(db),
+        )
+        _, duplicate_event = persist_c1_forecast_and_event(
+            db,
+            "patient-b",
+            reading(db),
+        )
+
+        episodes = db.scalars(
+            select(EscalationEpisode).where(
+                EscalationEpisode.subject_id == "patient-b"
+            )
+        ).all()
+        events = db.scalars(
+            select(AttentionEvent).where(AttentionEvent.subject_id == "patient-b")
+        ).all()
+
+    assert confirmed_event is not None
+    assert duplicate_event is None
+    assert len(episodes) == 1
+    assert len(events) == 1
+    assert events[0].episode_id == episodes[0].episode_id
 
 
 def test_patient_and_clinician_views_share_authoritative_fusion_identity():
