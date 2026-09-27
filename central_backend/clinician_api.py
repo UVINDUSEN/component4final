@@ -61,7 +61,14 @@ def require_clinician(authorization: Optional[str] = Header(None), db: Session =
         raise HTTPException(401, "missing bearer token")
     secret, issuer, audience = _jwt_settings()
     try:
-        claims = jwt.decode(authorization[7:], secret, algorithms=["HS256"], issuer=issuer, audience=audience)
+        claims = jwt.decode(
+            authorization[7:],
+            secret,
+            algorithms=["HS256"],
+            issuer=issuer,
+            audience=audience,
+            options={"require": ["sub", "clinician_id", "iat", "exp", "jti"]},
+        )
     except jwt.PyJWTError:
         raise HTTPException(401, "invalid or expired bearer token")
     clinician = db.get(Clinician, claims.get("clinician_id"))
