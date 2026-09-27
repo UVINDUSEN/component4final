@@ -385,11 +385,15 @@ def _assessment_for_row(row: Optional[FusionResult]) -> dict:
     if row is None:
         return _assessment_summary(())
     harmonisation = row.harmonisation or {}
+    gate_summary = harmonisation.get("gate") or {}
+    fallback = _assessment_summary(gate_summary.get("usable_modalities", ()))
     stored = harmonisation.get("assessment")
     if isinstance(stored, dict) and stored.get("status"):
-        return stored
-    gate_summary = harmonisation.get("gate") or {}
-    return _assessment_summary(gate_summary.get("usable_modalities", ()))
+        normalized = {**fallback, **stored}
+        if stored.get("status") == "complete":
+            normalized["missing_modalities"] = []
+        return normalized
+    return fallback
 
 
 def _auto_fuse(db: Session, subject_id: str, trigger: str,

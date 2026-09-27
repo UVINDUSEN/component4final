@@ -92,3 +92,57 @@ def test_non_clinician_role_cannot_use_clinician_api():
     client = TestClient(app)
     login = client.post("/auth/login", json={"clinician_id": "ADMIN1", "password": "secret"})
     assert login.status_code == 403
+
+
+def test_patient_and_clinician_views_share_authoritative_fusion_identity():
+    seed()
+    client = TestClient(app)
+    headers = auth(client)
+
+    patient = client.get("/v1/patients/patient-a/risk")
+    clinician = client.get(
+        "/v1/patients/patient-a/assessment/latest",
+        headers=headers,
+    )
+
+    assert patient.status_code == 200
+    assert clinician.status_code == 200
+    patient_body = patient.json()
+    clinician_body = clinician.json()
+
+    assert patient_body["fusion_result_id"] == clinician_body["fusion_result_id"]
+    assert patient_body["composite"] == clinician_body["current_assessment"]["score"]
+    assert patient_body["fusion_result_id"] is not None
+
+
+def test_patient_and_clinician_views_share_unavailable_state():
+    seed()
+    with SessionLocal() as db:
+        db.add(
+            ClinicianSubjectAssignment(
+                clinician_id="DR001",
+                subject_id="patient-b",
+            )
+        )
+        db.commit()
+
+    client = TestClient(app)
+    headers = auth(client)
+
+    patient = client.get("/v1/patients/patient-b/risk")
+    clinician = client.get(
+        "/v1/patients/patient-b/assessment/latest",
+        headers=headers,
+    )
+
+    assert patient.status_code == 200
+    assert clinician.status_code == 200
+    patient_body = patient.json()
+    clinician_body = clinician.json()
+
+    assert patient_body["fusion_result_id"] is None
+    assert clinician_body["fusion_result_id"] is None
+    assert patient_body["composite"] is None
+    assert clinician_body["current_assessment"] is None
+    assert patient_body["band"] == "GREY"
+    assert clinician_body["assessment_status"] == "unavailable"
