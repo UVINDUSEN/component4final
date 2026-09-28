@@ -101,6 +101,27 @@ class SubjectAlias(Base):
     subject: Mapped[Subject] = relationship(back_populates="aliases")
 
 
+class PatientCredential(Base):
+    """Proof that one Aura installation owns one canonical subject session.
+
+    Only a salted PBKDF2 digest is persisted. The installation secret itself
+    stays in the patient's secure mobile storage.
+    """
+
+    __tablename__ = "patient_credentials"
+
+    subject_id: Mapped[str] = mapped_column(
+        ForeignKey("subjects.subject_id"), primary_key=True
+    )
+    secret_hash: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    last_issued_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
 class Clinician(Base):
     __tablename__ = "clinicians"
     clinician_id: Mapped[str] = mapped_column(String(64), primary_key=True)

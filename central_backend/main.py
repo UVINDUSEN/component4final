@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from contextlib import asynccontextmanager
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 # Must run BEFORE any module-level os.getenv() calls elsewhere in this file
 # or in modules it imports (e.g. modality_clients.py reads C1_URL, C3_TOKEN,
@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -26,10 +26,14 @@ import identity
 import modality_clients as mc
 import rag_client
 from forecast import persist_c1_forecast_and_event
-from db_models import (AuditLog, FusionResult, ModalityReading, PairingCode,
-                       Subject, SubjectAlias, Verdict, get_session, init_db, utcnow, SupportBankNote, SessionLocal)
+from db_models import (AttentionEvent, AuditLog, FusionResult, ModalityReading, PairingCode,
+                       PatientCredential, Subject, SubjectAlias, Verdict,
+                       get_session, init_db, utcnow, SupportBankNote, SessionLocal)
 from clinician_api import (Principal, require_assignment, router as clinician_router,
                            service_or_clinician)
+from patient_auth import (PatientPrincipal, hash_installation_secret,
+                          issue_patient_token, patient_or_service, require_patient,
+                          verify_installation_secret)
 
 API_TOKEN = os.getenv("BACKEND_API_TOKEN", "")
 ALL_MODALITIES = ["c1_physiological", "c2_behavioral", "c3_clinical_nlp", "c4_demographic"]
@@ -103,6 +107,19 @@ def _resolve(db: Session, alias_type: str, alias_value: str) -> str:
     if not row:
         raise HTTPException(404, f"no subject for that {alias_type}")
     return row.subject_id
+
+
+def _patient_subject(
+    db: Session,
+    principal: Optional[PatientPrincipal],
+    subject_id: Optional[str],
+    app_user_id: Optional[str],
+) -> str:
+    resolved = subject_id or _resolve(db, "app_user_id", app_user_id or "")
+    _require_subject(db, resolved)
+    if principal is not None and principal.subject_id != resolved:
+        raise HTTPException(403, "patient principal cannot access another subject")
+    return resolved
 
 
 # Each component keys patients differently: C2 uses ids like "P_65DC4002E7863773",
@@ -198,10 +215,14 @@ class EnrolResponse(BaseModel):
 
 class SelfEnrolRequest(BaseModel):
     app_user_id: str = Field(..., pattern=r"^P_[A-F0-9]{16}$")
+    installation_secret: str = Field(..., min_length=32, max_length=256)
 
 
 class SelfEnrolResponse(BaseModel):
     subject_id: str
+    access_token: str
+    token_type: str
+    expires_at: dt.datetime
 
 
 @app.post("/v1/subjects/self", response_model=SelfEnrolResponse, tags=["enrolment"])
@@ -244,9 +265,34 @@ def self_enrol_subject(req: SelfEnrolRequest, db: Session = Depends(get_session)
         db.add(SubjectAlias(subject_id=subject_id, alias_type="mrn_hash",
                             alias_value=mrn_hash))
 
+    credential = db.get(PatientCredential, subject_id)
+    if credential is None:
+        credential = PatientCredential(
+            subject_id=subject_id,
+            secret_hash=hash_installation_secret(req.installation_secret),
+        )
+        db.add(credential)
+    elif not verify_installation_secret(
+        req.installation_secret, credential.secret_hash
+    ):
+        raise HTTPException(403, "invalid patient installation proof")
+
+    token, expires_at = issue_patient_token(subject_id)
+    credential.last_issued_at = utcnow()
+
     _audit(db, subject_id, event, {"alias": "app_user_id"})
     db.commit()
-    return SelfEnrolResponse(subject_id=subject_id)
+    return SelfEnrolResponse(
+        subject_id=subject_id,
+        access_token=token,
+        token_type="bearer",
+        expires_at=expires_at,
+    )
+
+
+@app.get("/v1/patients/me", response_model=PatientPrincipal, tags=["patient-auth"])
+def patient_me(principal: PatientPrincipal = Depends(require_patient)):
+    return principal.model_dump()
 
 
 @app.post("/v1/subjects", response_model=EnrolResponse, tags=["enrolment"])
@@ -452,11 +498,11 @@ class PhysiologicalWindow(BaseModel):
 
 @app.post("/v1/ingest/physiological", tags=["ingestion"])
 def ingest_physiological(req: PhysiologicalWindow, db: Session = Depends(get_session),
-                         authorization: Optional[str] = Header(None)):
+                         principal: Optional[PatientPrincipal] = Depends(patient_or_service)):
     """Fetch and store C1's latest prediction for this participant."""
-    _auth(authorization)
-    subject_id = req.subject_id or _resolve(db, "app_user_id", req.app_user_id or "")
-    _require_subject(db, subject_id)
+    subject_id = _patient_subject(
+        db, principal, req.subject_id, req.app_user_id
+    )
 
     c1_user_id = (req.device_user_id or req.app_user_id or
                   _external_id(db, subject_id, "c1_physiological"))
@@ -516,12 +562,12 @@ class ContextualIntake(BaseModel):
 
 @app.post("/v1/ingest/contextual", tags=["ingestion"])
 def ingest_contextual(req: ContextualIntake, db: Session = Depends(get_session),
-                      authorization: Optional[str] = Header(None)):
+                      principal: Optional[PatientPrincipal] = Depends(patient_or_service)):
     """Steps 18-21. Demographics + GAD-7 from the patient app, scored once by
     your DCAR model."""
-    _auth(authorization)
-    subject_id = req.subject_id or _resolve(db, "app_user_id", req.app_user_id or "")
-    _require_subject(db, subject_id)
+    subject_id = _patient_subject(
+        db, principal, req.subject_id, req.app_user_id
+    )
 
     gad7_total = None
     if req.gad7_items is not None:
@@ -774,14 +820,18 @@ def _latest_fusion(db: Session, subject_id: str) -> Optional[FusionResult]:
 
 
 @app.get("/v1/patients/{subject_id}/risk", tags=["egress"])
-def patient_risk(subject_id: str, db: Session = Depends(get_session)):
+def patient_risk(
+    subject_id: str,
+    db: Session = Depends(get_session),
+    principal: Optional[PatientPrincipal] = Depends(patient_or_service),
+):
     """Steps 32-33. PATIENT view: composite, band, updated_at. Nothing else.
 
     Deliberately withholds per-modality scores, weights and any clinical note
     content. A patient seeing "your clinical notes score is 0.81" without a
     clinician present is a harm, not transparency.
     """
-    _require_subject(db, subject_id)
+    subject_id = _patient_subject(db, principal, subject_id, None)
     row = _latest_fusion(db, subject_id)
     assessment = _assessment_for_row(row)
     if not row:
@@ -799,6 +849,48 @@ def patient_risk(subject_id: str, db: Session = Depends(get_session)):
             "updated_at": row.computed_at,
             "assessment_status": assessment["status"],
             "missing_modalities": assessment["missing_modalities"]}
+
+
+class PatientAttentionEvent(BaseModel):
+    id: str
+    event_type: str
+    severity: str
+    forecast_horizon: int
+    status: str
+    created_at: dt.datetime
+    policy_version: str
+
+
+class PatientAttentionEventsResponse(BaseModel):
+    events: List[PatientAttentionEvent]
+
+
+@app.get(
+    "/v1/patients/me/attention-events",
+    tags=["patient-events"],
+    response_model=PatientAttentionEventsResponse,
+)
+def patient_attention_events(
+    status: Optional[Literal["OPEN", "ACKNOWLEDGED", "RESOLVED"]] = Query(None),
+    db: Session = Depends(get_session),
+    principal: PatientPrincipal = Depends(require_patient),
+):
+    stmt = select(AttentionEvent).where(
+        AttentionEvent.subject_id == principal.subject_id
+    )
+    if status:
+        stmt = stmt.where(AttentionEvent.status == status)
+    events = db.scalars(stmt.order_by(AttentionEvent.created_at.desc())).all()
+    fields = (
+        "id",
+        "event_type",
+        "severity",
+        "forecast_horizon",
+        "status",
+        "created_at",
+        "policy_version",
+    )
+    return {"events": [{key: getattr(event, key) for key in fields} for event in events]}
 
 
 @app.get("/v1/doctor/patients/{subject_id}/timeline", tags=["egress"])

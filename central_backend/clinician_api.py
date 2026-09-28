@@ -11,7 +11,7 @@ from typing import Literal, Optional
 
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -135,7 +135,8 @@ class EventWire(BaseModel):
     id: str; subject_id: str; fusion_result_id: Optional[int]; forecast_result_id: Optional[str]
     event_type: str; severity: str; reason: str; forecast_horizon: int; status: str
     created_at: dt.datetime; acknowledged_at: Optional[dt.datetime]; acknowledged_by: Optional[str]
-    resolved_at: Optional[dt.datetime]; resolved_by: Optional[str]; policy_version: str
+    resolved_at: Optional[dt.datetime]; resolved_by: Optional[str]
+    resolution_note: Optional[str]; policy_version: str
 class EventResponse(BaseModel): event: EventWire
 class EventsResponse(BaseModel): events: list[EventWire]
 
@@ -265,7 +266,8 @@ def roster(db: Session = Depends(get_session), principal: Principal = Depends(re
 def _event_wire(e):
     return {key: getattr(e, key) for key in ("id", "subject_id", "fusion_result_id", "forecast_result_id",
         "event_type", "severity", "reason", "forecast_horizon", "status", "created_at",
-        "acknowledged_at", "acknowledged_by", "resolved_at", "resolved_by", "policy_version")}
+        "acknowledged_at", "acknowledged_by", "resolved_at", "resolved_by",
+        "resolution_note", "policy_version")}
 
 
 @router.get("/v1/clinicians/me/dashboard", tags=["clinician"])
@@ -305,6 +307,20 @@ class EmptyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ResolveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    note: Optional[str] = Field(None, max_length=255)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def normalize_note(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        return value.strip() or None
+
+
 @router.post("/v1/attention-events/{event_id}/acknowledge", tags=["attention-events"], response_model=EventResponse)
 def acknowledge(event_id: str, body: EmptyBody, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
     _assigned_event(db, principal, event_id); now = utcnow()
@@ -315,9 +331,10 @@ def acknowledge(event_id: str, body: EmptyBody, db: Session = Depends(get_sessio
 
 
 @router.post("/v1/attention-events/{event_id}/resolve", tags=["attention-events"], response_model=EventResponse)
-def resolve(event_id: str, body: EmptyBody, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
+def resolve(event_id: str, body: ResolveBody, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
     _assigned_event(db, principal, event_id); now = utcnow()
     result = db.execute(update(AttentionEvent).where(AttentionEvent.id == event_id, AttentionEvent.status == "ACKNOWLEDGED")
-        .values(status="RESOLVED", resolved_at=now, resolved_by=principal.clinician_id))
+        .values(status="RESOLVED", resolved_at=now, resolved_by=principal.clinician_id,
+                resolution_note=body.note))
     if result.rowcount != 1: db.rollback(); raise HTTPException(409, "event state has changed")
     db.commit(); return {"event": _event_wire(db.get(AttentionEvent, event_id))}
