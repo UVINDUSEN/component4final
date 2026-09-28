@@ -2,6 +2,10 @@ import datetime as dt
 import os
 
 os.environ.setdefault("CLINICIAN_JWT_SECRET", "test-secret-that-is-long-enough-for-tests")
+os.environ.setdefault(
+    "PATIENT_JWT_SECRET",
+    "patient-contract-secret-that-is-long-enough-for-tests",
+)
 
 import jwt
 import pytest
@@ -14,6 +18,7 @@ from db_models import (AttentionEvent, Clinician, ClinicianSubjectAssignment,
                        ModalityReading, SessionLocal, Subject, init_db, utcnow)
 from forecast import persist_c1_forecast_and_event
 from main import app
+from patient_auth import issue_patient_token
 
 
 def setup_function():
@@ -57,6 +62,11 @@ def auth(client, clinician_id="DR001"):
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
+def patient_auth(subject_id):
+    token, _ = issue_patient_token(subject_id)
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_auth_dashboard_assessment_and_assignment_scope():
     seed(); client = TestClient(app); headers = auth(client)
     assert client.get("/v1/me", headers=headers).status_code == 200
@@ -78,6 +88,54 @@ def test_attention_lifecycle_is_atomic_and_server_attributed():
     resolved = client.post("/v1/attention-events/evt_test/resolve", headers=headers, json={})
     assert resolved.status_code == 200 and resolved.json()["event"]["resolved_by"] == "DR001"
     assert client.post("/v1/attention-events/evt_test/resolve", headers=headers, json={}).status_code == 409
+
+
+def test_resolution_note_is_optional_normalized_and_server_persisted():
+    seed()
+    client = TestClient(app)
+    headers = auth(client)
+    assert client.post(
+        "/v1/attention-events/evt_test/acknowledge",
+        headers=headers,
+        json={},
+    ).status_code == 200
+
+    resolved = client.post(
+        "/v1/attention-events/evt_test/resolve",
+        headers=headers,
+        json={"note": "  Follow-up arranged with patient.  "},
+    )
+    detail = client.get("/v1/attention-events/evt_test", headers=headers)
+
+    assert resolved.status_code == 200
+    assert resolved.json()["event"]["resolution_note"] == (
+        "Follow-up arranged with patient."
+    )
+    assert detail.json()["event"]["resolution_note"] == (
+        "Follow-up arranged with patient."
+    )
+
+
+def test_resolution_note_rejects_unknown_or_overlong_fields():
+    seed()
+    client = TestClient(app)
+    headers = auth(client)
+    assert client.post(
+        "/v1/attention-events/evt_test/acknowledge",
+        headers=headers,
+        json={},
+    ).status_code == 200
+
+    assert client.post(
+        "/v1/attention-events/evt_test/resolve",
+        headers=headers,
+        json={"reason": "not the frozen field"},
+    ).status_code == 422
+    assert client.post(
+        "/v1/attention-events/evt_test/resolve",
+        headers=headers,
+        json={"note": "x" * 256},
+    ).status_code == 422
 
 
 def test_openapi_contains_frozen_paths_and_strict_empty_body():
@@ -469,7 +527,10 @@ def test_patient_and_clinician_views_share_authoritative_fusion_identity():
     client = TestClient(app)
     headers = auth(client)
 
-    patient = client.get("/v1/patients/patient-a/risk")
+    patient = client.get(
+        "/v1/patients/patient-a/risk",
+        headers=patient_auth("patient-a"),
+    )
     clinician = client.get(
         "/v1/patients/patient-a/assessment/latest",
         headers=headers,
@@ -499,7 +560,10 @@ def test_patient_and_clinician_views_share_unavailable_state():
     client = TestClient(app)
     headers = auth(client)
 
-    patient = client.get("/v1/patients/patient-b/risk")
+    patient = client.get(
+        "/v1/patients/patient-b/risk",
+        headers=patient_auth("patient-b"),
+    )
     clinician = client.get(
         "/v1/patients/patient-b/assessment/latest",
         headers=headers,

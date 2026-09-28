@@ -22,6 +22,8 @@ _tmpdb = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 os.environ["DATABASE_URL"] = f"sqlite:///{_tmpdb.name}"
 os.environ["MRN_PEPPER"] = "test-pepper-not-for-production"
 os.environ["FUSION_MODE"] = "inprocess"
+os.environ["BACKEND_API_TOKEN"] = "test-backend-service-token"
+os.environ["PATIENT_JWT_SECRET"] = "patient-test-secret-that-is-long-enough"
 os.environ["FUSION_SERVICE_DIR"] = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "fusion_service"))
 
@@ -32,9 +34,19 @@ import identity  # noqa: E402
 import modality_clients as mc  # noqa: E402
 from main import app  # noqa: E402
 
-client = TestClient(app)
+client = TestClient(
+    app,
+    headers={"Authorization": "Bearer test-backend-service-token"},
+)
 
 passed, failed = 0, 0
+
+
+def self_enrol_body(app_user_id):
+    return {
+        "app_user_id": app_user_id,
+        "installation_secret": "test-installation-secret-with-at-least-32-characters",
+    }
 
 
 def check(name, cond, detail=""):
@@ -168,12 +180,12 @@ check("MRN normalised (case/whitespace)", r.json().get("subject_id") == P1)
 
 # Patient-first flow: Aura registers before the clinician scans its QR.
 self_id = "P_1234567890ABCDEF"
-r = client.post("/v1/subjects/self", json={"app_user_id": self_id})
+r = client.post("/v1/subjects/self", json=self_enrol_body(self_id))
 check("patient self-enrolment returns 200", r.status_code == 200, r.text)
 P_SELF = r.json().get("subject_id")
 check("self-enrolment returns a subject UUID", len(P_SELF or "") == 36)
 
-r = client.post("/v1/subjects/self", json={"app_user_id": self_id})
+r = client.post("/v1/subjects/self", json=self_enrol_body(self_id))
 check("repeated self-enrolment reuses subject",
       r.status_code == 200 and r.json().get("subject_id") == P_SELF, r.text)
 
@@ -191,11 +203,11 @@ check("doctor enrolment reuses the self-enrolled subject",
 doctor_first_id = "P_FEDCBA0987654321"
 r = client.post("/v1/subjects", json={"mrn": doctor_first_id})
 P_DOCTOR_FIRST = r.json().get("subject_id")
-r = client.post("/v1/subjects/self", json={"app_user_id": doctor_first_id})
+r = client.post("/v1/subjects/self", json=self_enrol_body(doctor_first_id))
 check("self-enrolment reuses an existing doctor subject",
       r.status_code == 200 and r.json().get("subject_id") == P_DOCTOR_FIRST, r.text)
 
-r = client.post("/v1/subjects/self", json={"app_user_id": "invalid"})
+r = client.post("/v1/subjects/self", json=self_enrol_body("invalid"))
 check("self-enrolment rejects malformed participant IDs", r.status_code == 422,
       f"got {r.status_code}: {r.text}")
 
@@ -855,7 +867,7 @@ def _capture_c1_call(user_id, window=None, client=None):
 
 main.mc.call_c1 = _capture_c1_call
 _c1_participant = "P_ABCDEF0123456789"
-client.post("/v1/subjects/self", json={"app_user_id": _c1_participant})
+client.post("/v1/subjects/self", json=self_enrol_body(_c1_participant))
 _c1_ingest = client.post("/v1/ingest/physiological", json={
     "app_user_id": _c1_participant,
     "features": {"mean_hr": 99.0, "sdnn": 0.0, "rmssd": 0.0},
