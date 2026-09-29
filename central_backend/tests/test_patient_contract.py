@@ -21,6 +21,7 @@ from db_models import (
     SessionLocal,
     Subject,
     SubjectAlias,
+    PairingCode,
     init_db,
 )
 from main import app
@@ -38,15 +39,17 @@ def setup_function():
         db.execute(delete(FusionResult))
         db.execute(delete(AuditLog))
         db.execute(delete(PatientCredential))
+        db.execute(delete(PairingCode))
         db.execute(delete(SubjectAlias))
         db.execute(delete(Subject))
         db.commit()
 
 
-def _self_enrol(client: TestClient, secret: str = INSTALLATION_SECRET):
+def _self_enrol(client: TestClient, secret: str = INSTALLATION_SECRET, pairing_code=None):
     return client.post(
         "/v1/subjects/self",
-        json={"app_user_id": PARTICIPANT_ID, "installation_secret": secret},
+        json={"app_user_id": PARTICIPANT_ID, "installation_secret": secret,
+              **({"pairing_code": pairing_code} if pairing_code else {})},
     )
 
 
@@ -95,6 +98,29 @@ def test_self_enrolment_requires_the_original_installation_proof():
     assert repeated.status_code == 200
     assert repeated.json()["subject_id"] == first.json()["subject_id"]
     assert wrong_proof.status_code == 403
+
+
+def test_existing_subject_cannot_be_claimed_by_identifier_without_pairing_proof():
+    from identity import hash_mrn
+    from db_models import utcnow
+    client = TestClient(app)
+    with SessionLocal() as db:
+        db.add(Subject(subject_id="preexisting"))
+        db.add(SubjectAlias(subject_id="preexisting", alias_type="mrn_hash",
+                            alias_value=hash_mrn(PARTICIPANT_ID)))
+        db.add(PairingCode(code="PROOF123", subject_id="preexisting",
+                           expires_at=utcnow() + dt.timedelta(minutes=5)))
+        db.commit()
+    assert _self_enrol(client).status_code == 403
+    claim = _self_enrol(client, pairing_code="PROOF123")
+    assert claim.status_code == 200
+    assert claim.json()["subject_id"] == "preexisting"
+    assert _self_enrol(client).status_code == 200
+    with SessionLocal() as db:
+        assert db.get(PairingCode, "PROOF123").used_at is not None
+        db.get(PatientCredential, "preexisting").secret_hash = "invalid"
+        db.commit()
+    assert _self_enrol(client, pairing_code="PROOF123").status_code == 403
 
 
 @pytest.mark.parametrize(
@@ -202,6 +228,28 @@ def test_patient_risk_requires_authentication_and_is_self_scoped():
     assert own.json()["subject_id"] == subject_id
     assert own.json()["fusion_result_id"] is not None
     assert cross.status_code == 403
+
+
+def test_patient_risk_includes_server_tier_and_separate_physiological_forecast():
+    client = TestClient(app)
+    subject_id, headers = _patient_session(client)
+    with SessionLocal() as db:
+        db.add(FusionResult(subject_id=subject_id, composite=.58, tier="Medium",
+                            band="AMBER", confidence=.71))
+        db.add(ForecastResult(forecast_result_id="fcst_patient", subject_id=subject_id,
+                              scope="physiological", horizon_minutes=10, score=.84,
+                              tier="High", escalation_predicted=True,
+                              generated_at=dt.datetime.now(dt.timezone.utc),
+                              valid_until=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)))
+        db.commit()
+    body = client.get(f"/v1/patients/{subject_id}/risk", headers=headers).json()
+    assert body["tier"] == "Medium"
+    assert body["band"] == "AMBER"
+    assert body["forecast"]["scope"] == "physiological"
+    assert body["forecast"]["score"] == .84
+    assert body["forecast"]["tier"] == "High"
+    assert body["forecast"]["horizon_minutes"] == 10
+    assert body["forecast"]["valid_until"]
 
 
 def test_patient_attention_events_use_server_records_and_privacy_projection():

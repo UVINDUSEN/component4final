@@ -143,6 +143,17 @@ class ClinicianSubjectAssignment(Base):
     ended_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
 
 
+class ClinicianAssignmentInvite(Base):
+    """Patient-authorized, short-lived, single-use invitation; plaintext is never stored."""
+    __tablename__ = "clinician_assignment_invites"
+    code_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(ForeignKey("subjects.subject_id"), index=True)
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    redeemed_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    redeemed_by: Mapped[Optional[str]] = mapped_column(String(64))
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class PairingCode(Base):
     """Short-lived code the clinician reads aloud to the patient.
 
@@ -208,6 +219,7 @@ class ForecastResult(Base):
     forecast_result_id: Mapped[str] = mapped_column(String(48), primary_key=True)
     subject_id: Mapped[str] = mapped_column(ForeignKey("subjects.subject_id"), index=True)
     source_reading_id: Mapped[Optional[int]] = mapped_column(ForeignKey("modality_readings.id"))
+    source_fusion_result_id: Mapped[Optional[int]] = mapped_column(ForeignKey("fusion_results.id"), index=True)
     scope: Mapped[str] = mapped_column(String(32), default="physiological")
     horizon_minutes: Mapped[int] = mapped_column(Integer)
     score: Mapped[Optional[float]] = mapped_column(Float)

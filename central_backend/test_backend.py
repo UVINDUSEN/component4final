@@ -203,8 +203,13 @@ check("doctor enrolment reuses the self-enrolled subject",
 doctor_first_id = "P_FEDCBA0987654321"
 r = client.post("/v1/subjects", json={"mrn": doctor_first_id})
 P_DOCTOR_FIRST = r.json().get("subject_id")
+doctor_first_code = r.json().get("pairing_code")
 r = client.post("/v1/subjects/self", json=self_enrol_body(doctor_first_id))
-check("self-enrolment reuses an existing doctor subject",
+check("known ID cannot claim an existing doctor subject without proof",
+      r.status_code == 403, r.text)
+r = client.post("/v1/subjects/self", json={**self_enrol_body(doctor_first_id),
+                                            "pairing_code": doctor_first_code})
+check("pairing proof binds self-enrolment to an existing doctor subject",
       r.status_code == 200 and r.json().get("subject_id") == P_DOCTOR_FIRST, r.text)
 
 r = client.post("/v1/subjects/self", json=self_enrol_body("invalid"))
@@ -345,7 +350,16 @@ check("phone cannot be re-paired to a second patient", r.status_code in (409, 41
 section("8 · Staleness — tightened freshness windows (service contract §5)")
 from sqlalchemy import select  # noqa: E402
 
-from db_models import ModalityReading, SessionLocal  # noqa: E402
+from db_models import FusionResult, ModalityReading, SessionLocal  # noqa: E402
+
+with SessionLocal() as db:
+    latest_fusion = db.scalar(select(FusionResult).where(
+        FusionResult.subject_id == P1).order_by(FusionResult.id.desc()))
+    source_ids = (latest_fusion.harmonisation or {}).get("source_reading_ids", {})
+    c3_source = db.get(ModalityReading, source_ids.get("c3_clinical_nlp"))
+    check("fusion persists the exact C3 evidence reading for history",
+          c3_source is not None and c3_source.subject_id == P1 and
+          c3_source.modality == "c3_clinical_nlp")
 
 import gate  # noqa: E402
 

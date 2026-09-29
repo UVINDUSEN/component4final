@@ -9,20 +9,22 @@ import secrets
 import uuid
 from typing import Literal, Optional
 
+import gate
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from db_models import (AttentionEvent, Clinician, ClinicianSubjectAssignment,
+from db_models import (AttentionEvent, AuditLog, Clinician, ClinicianAssignmentInvite, ClinicianSubjectAssignment,
                        ForecastResult, FusionResult, ModalityReading, Subject,
                        get_session, utcnow)
+from patient_auth import PatientPrincipal, require_patient
 
 router = APIRouter()
 ALL_MODALITIES = ["c1_physiological", "c2_behavioral", "c3_clinical_nlp", "c4_demographic"]
-MAX_AGE_MINUTES = {"c1_physiological": 2, "c2_behavioral": 24 * 60,
-                   "c3_clinical_nlp": 30 * 24 * 60, "c4_demographic": None}
+MAX_AGE_MINUTES = gate.MAX_AGE_MINUTES
 
 
 def hash_password(password: str, salt: Optional[bytes] = None) -> str:
@@ -92,11 +94,7 @@ def require_clinician(authorization: Optional[str] = Header(None), db: Session =
 
 def service_or_clinician(authorization: Optional[str] = Header(None), db: Session = Depends(get_session)) -> Optional[Principal]:
     service_token = os.getenv("BACKEND_API_TOKEN", "")
-    if service_token and authorization == f"Bearer {service_token}":
-        return None
-    # Preserve the repository's unsecured local-development mode. Deployments
-    # must set BACKEND_API_TOKEN; once configured, anonymous access is rejected.
-    if not service_token and not authorization:
+    if service_token and authorization and hmac.compare_digest(authorization, f"Bearer {service_token}"):
         return None
     return require_clinician(authorization, db)
 
@@ -106,7 +104,18 @@ def require_assignment(db: Session, principal: Principal, subject_id: str) -> No
         ClinicianSubjectAssignment.clinician_id == principal.clinician_id,
         ClinicianSubjectAssignment.subject_id == subject_id,
         ClinicianSubjectAssignment.active.is_(True)))
-    if not assigned: raise HTTPException(403, "patient is not assigned to this clinician")
+    if not assigned:
+        db.add(AuditLog(subject_id=subject_id, event="access.denied",
+                        actor=principal.clinician_id, detail={"reason": "not_assigned"}))
+        db.commit()
+        raise HTTPException(403, "patient is not assigned to this clinician")
+
+
+def audit_clinician(db: Session, subject_id: Optional[str], event: str, principal: Principal,
+                    detail: Optional[dict] = None) -> None:
+    db.add(AuditLog(subject_id=subject_id, event=event,
+                    actor=principal.clinician_id, detail=detail))
+    db.commit()
 
 
 class LoginRequest(BaseModel):
@@ -127,6 +136,9 @@ class ModalityWire(BaseModel):
     component_id: str; score: Optional[float]; available: bool; included_in_fusion: bool
     status: str; confidence: Optional[float]; coverage: Optional[float]
     captured_at: Optional[dt.datetime]; contribution: Optional[float]
+    freshness_age_minutes: Optional[float] = None
+    max_age_minutes: Optional[int] = None
+    exclusion_reason: Optional[str] = None
 class AssessmentWire(BaseModel):
     subject_id: str; fusion_result_id: Optional[int]; current_assessment: Optional[CurrentAssessment]
     forecast: Optional[ForecastWire]; confidence: Optional[float]; assessment_status: str
@@ -178,6 +190,22 @@ def _latest_forecast(db: Session, subject_id: str, as_of: Optional[dt.datetime] 
         .order_by(ForecastResult.generated_at.desc()).limit(1))
 
 
+def _forecast_for_assessment(db: Session, row: FusionResult):
+    stmt = select(ForecastResult).where(
+        ForecastResult.subject_id == row.subject_id,
+        ForecastResult.source_fusion_result_id == row.id)
+    snapshot = (row.harmonisation or {}).get("source_reading_ids")
+    if snapshot is not None:
+        reading_id = snapshot.get("c1_physiological")
+        if reading_id is None:
+            return None
+        stmt = stmt.where(ForecastResult.source_reading_id == reading_id)
+    # Old rows cannot recover their source reading; pin the earliest linked
+    # forecast rather than replacing the displayed history on every poll.
+    return db.scalar(stmt.order_by(ForecastResult.generated_at.asc(),
+                                   ForecastResult.forecast_result_id.asc()).limit(1))
+
+
 def _forecast_wire(f):
     if not f: return None
     return {"forecast_result_id": f.forecast_result_id, "scope": f.scope,
@@ -188,33 +216,54 @@ def _forecast_wire(f):
 
 
 def _assessment_wire(db: Session, subject_id: str, row: Optional[FusionResult],
-                     as_of: Optional[dt.datetime] = None):
+                     as_of: Optional[dt.datetime] = None,
+                     historical: bool = False):
     as_of = as_of or utcnow()
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=dt.timezone.utc)
-    readings = db.scalars(select(ModalityReading).where(ModalityReading.subject_id == subject_id,
-                         ModalityReading.captured_at <= as_of)
-                         .order_by(ModalityReading.captured_at.desc(), ModalityReading.id.desc())).all()
-    latest = {}; now = as_of
-    for r in readings: latest.setdefault(r.modality, r)
+    snapshot = (row.harmonisation or {}).get("source_reading_ids") if row else None
+    if snapshot is not None:
+        readings = db.scalars(select(ModalityReading).where(
+            ModalityReading.subject_id == subject_id,
+            ModalityReading.id.in_(list(snapshot.values())))).all() if snapshot else []
+        latest = {r.modality: r for r in readings
+                  if snapshot.get(r.modality) == r.id}
+    else:
+        # Historical pre-snapshot rows retain the legacy best-effort view.
+        readings = db.scalars(select(ModalityReading).where(
+            ModalityReading.subject_id == subject_id, ModalityReading.captured_at <= as_of)
+            .order_by(ModalityReading.captured_at.desc(), ModalityReading.id.desc())).all()
+        latest = {}
+        for r in readings: latest.setdefault(r.modality, r)
+    now = as_of
     modalities = []
     for name in ALL_MODALITIES:
         r = latest.get(name)
         if not r:
             modalities.append({"component_id": name, "score": None, "available": False,
                 "included_in_fusion": False, "status": "absent", "confidence": None,
-                "coverage": None, "captured_at": None, "contribution": None})
+                "coverage": None, "captured_at": None, "contribution": None,
+                "freshness_age_minutes": None, "max_age_minutes": MAX_AGE_MINUTES[name],
+                "exclusion_reason": "research-only" if name == "c2_behavioral" else "absent"})
             continue
         captured = r.captured_at.replace(tzinfo=dt.timezone.utc) if r.captured_at.tzinfo is None else r.captured_at
-        max_age = MAX_AGE_MINUTES[name]; fresh = max_age is None or (now-captured).total_seconds() <= max_age*60
-        included = bool(row and fresh and r.status == "ok" and name != "c2_behavioral" and name in (row.weights or {}))
+        max_age = MAX_AGE_MINUTES[name]
+        age = max(0.0, (now-captured).total_seconds() / 60)
+        fresh = max_age is None or age <= max_age
+        included = bool(row and name != "c2_behavioral" and name in (row.weights or {})
+                        and (snapshot is None or snapshot.get(name) == r.id))
         modalities.append({"component_id": name, "score": r.raw_score, "available": r.status == "ok" and fresh,
             "included_in_fusion": included, "status": r.status if fresh else "stale",
             "confidence": r.confidence, "coverage": r.coverage, "captured_at": r.captured_at,
-            "contribution": (row.contributions or {}).get(name) if row else None})
+            "contribution": (row.contributions or {}).get(name) if row else None,
+            "freshness_age_minutes": round(age, 2), "max_age_minutes": max_age,
+            "exclusion_reason": ("research-only" if name == "c2_behavioral" else
+                                 "stale" if not fresh else
+                                 r.status if r.status != "ok" else None)})
     return {"subject_id": subject_id, "fusion_result_id": row.id if row else None,
             "current_assessment": ({"score": row.composite, "tier": row.tier, "band": row.band} if row else None),
-            "forecast": _forecast_wire(_latest_forecast(db, subject_id, as_of)),
+            "forecast": _forecast_wire(_forecast_for_assessment(db, row) if historical and row else
+                                       _latest_forecast(db, subject_id, as_of)),
             "confidence": row.confidence if row else None, "assessment_status": _assessment_status(row),
             "modalities": modalities, "computed_at": row.computed_at if row else None,
             "model_version": row.model_version if row else None}
@@ -230,6 +279,8 @@ def _assigned_ids(db, principal):
 def latest_assessment(subject_id: str, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
     require_assignment(db, principal, subject_id)
     row = db.scalar(select(FusionResult).where(FusionResult.subject_id == subject_id).order_by(FusionResult.computed_at.desc(), FusionResult.id.desc()).limit(1))
+    audit_clinician(db, subject_id, "assessment.read", principal,
+                    {"fusion_result_id": row.id if row else None})
     return _assessment_wire(db, subject_id, row)
 
 
@@ -237,12 +288,18 @@ def latest_assessment(subject_id: str, db: Session = Depends(get_session), princ
 def assessments(subject_id: str, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
     require_assignment(db, principal, subject_id)
     rows = db.scalars(select(FusionResult).where(FusionResult.subject_id == subject_id).order_by(FusionResult.computed_at.desc())).all()
-    return {"assessments": [_assessment_wire(db, subject_id, row, row.computed_at) for row in rows]}
+    audit_clinician(db, subject_id, "assessment.history_read", principal,
+                    {"count": len(rows)})
+    events = db.scalars(select(AttentionEvent).where(AttentionEvent.subject_id == subject_id)
+                        .order_by(AttentionEvent.created_at.desc())).all()
+    return {"assessments": [_assessment_wire(db, subject_id, row, row.computed_at, historical=True) for row in rows],
+            "events": [_event_wire(event) for event in events]}
 
 
 @router.get("/v1/patients/{subject_id}/data-quality", tags=["clinician"])
 def data_quality(subject_id: str, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
     require_assignment(db, principal, subject_id)
+    audit_clinician(db, subject_id, "assessment.data_quality_read", principal)
     return {"subject_id": subject_id, "modalities": _assessment_wire(db, subject_id, None)["modalities"]}
 
 
@@ -250,7 +307,8 @@ def _patient_summary(db, sid):
     row = db.scalar(select(FusionResult).where(FusionResult.subject_id == sid).order_by(FusionResult.computed_at.desc(), FusionResult.id.desc()).limit(1))
     f = _latest_forecast(db, sid)
     count = len(db.scalars(select(AttentionEvent.id).where(AttentionEvent.subject_id == sid, AttentionEvent.status == "OPEN")).all())
-    return {"subject_id": sid, "display_id": sid, "fusion_result_id": row.id if row else None,
+    display_id = "Patient " + hashlib.sha256(f"display-v1:{sid}".encode()).hexdigest()[:8].upper()
+    return {"subject_id": sid, "display_id": display_id, "fusion_result_id": row.id if row else None,
             "current": {"score": row.composite if row else None, "tier": row.tier if row else None},
             "forecast": ({"score": f.score, "tier": f.tier, "horizon_minutes": f.horizon_minutes,
                           "predicted": f.escalation_predicted, "escalation_predicted": f.escalation_predicted} if f else None),
@@ -260,6 +318,7 @@ def _patient_summary(db, sid):
 
 @router.get("/v1/clinicians/me/patients", tags=["clinician"])
 def roster(db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
+    audit_clinician(db, None, "roster.read", principal)
     return {"patients": [_patient_summary(db, sid) for sid in _assigned_ids(db, principal)]}
 
 
@@ -273,6 +332,7 @@ def _event_wire(e):
 @router.get("/v1/clinicians/me/dashboard", tags=["clinician"])
 def dashboard(db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
     ids = _assigned_ids(db, principal)
+    audit_clinician(db, None, "dashboard.read", principal, {"assigned_count": len(ids)})
     events = db.scalars(select(AttentionEvent).where(AttentionEvent.subject_id.in_(ids), AttentionEvent.status == "OPEN").order_by(AttentionEvent.created_at.desc())).all() if ids else []
     return {"clinician": {"clinician_id": principal.clinician_id, "display_name": principal.display_name},
             "assigned_count": len(ids), "open_attention_events": [_event_wire(e) for e in events],
@@ -285,6 +345,7 @@ def list_events(status: Optional[Literal["OPEN", "ACKNOWLEDGED", "RESOLVED"]] = 
     ids = _assigned_ids(db, principal)
     if subject_id:
         require_assignment(db, principal, subject_id); ids = [subject_id]
+    audit_clinician(db, subject_id, "attention.list", principal, {"status": status})
     if not ids: return {"events": []}
     stmt = select(AttentionEvent).where(AttentionEvent.subject_id.in_(ids))
     if status: stmt = stmt.where(AttentionEvent.status == status)
@@ -300,11 +361,83 @@ def _assigned_event(db, principal, event_id):
 
 @router.get("/v1/attention-events/{event_id}", tags=["attention-events"], response_model=EventResponse)
 def event_detail(event_id: str, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
-    return {"event": _event_wire(_assigned_event(db, principal, event_id))}
+    event = _assigned_event(db, principal, event_id)
+    audit_clinician(db, event.subject_id, "attention.read", principal, {"event_id": event_id})
+    return {"event": _event_wire(event)}
 
 
 class EmptyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class AssignmentInviteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    invite_code: str = Field(..., min_length=1, max_length=128)
+
+
+@router.post("/v1/patients/me/assignment-invites", tags=["patient-auth"])
+def create_assignment_invite(body: EmptyBody,
+                             principal: PatientPrincipal = Depends(require_patient),
+                             db: Session = Depends(get_session)):
+    code = secrets.token_urlsafe(32)
+    expires = utcnow() + dt.timedelta(minutes=10)
+    db.add(ClinicianAssignmentInvite(code_hash=hashlib.sha256(code.encode()).hexdigest(),
+                                      subject_id=principal.subject_id, expires_at=expires))
+    db.add(AuditLog(subject_id=principal.subject_id, event="assignment.invite_created",
+                    actor=f"patient:{principal.subject_id}", detail={"expires_at": expires.isoformat()}))
+    db.commit()
+    return {"invite_code": code, "expires_at": expires}
+
+
+@router.post("/v1/clinicians/me/assignments", tags=["clinician"])
+def accept_assignment_invite(body: AssignmentInviteRequest,
+                             principal: Principal = Depends(require_clinician),
+                             db: Session = Depends(get_session)):
+    digest = hashlib.sha256(body.invite_code.encode()).hexdigest()
+    invite = db.scalar(select(ClinicianAssignmentInvite).where(
+        ClinicianAssignmentInvite.code_hash == digest).with_for_update())
+    if invite is None:
+        raise HTTPException(404, "assignment invite not found")
+    if invite.redeemed_at is not None:
+        raise HTTPException(409, "assignment invite already used")
+    expires = invite.expires_at.replace(tzinfo=dt.timezone.utc) if invite.expires_at.tzinfo is None else invite.expires_at
+    if expires <= utcnow():
+        raise HTTPException(410, "assignment invite expired")
+    subject = db.scalar(select(Subject).where(
+        Subject.subject_id == invite.subject_id).with_for_update())
+    if subject is None or subject.status != "active":
+        raise HTTPException(409, "subject is not active")
+    now = utcnow()
+    updated = db.execute(update(ClinicianAssignmentInvite).where(
+        ClinicianAssignmentInvite.code_hash == digest,
+        ClinicianAssignmentInvite.redeemed_at.is_(None)).values(
+            redeemed_at=now, redeemed_by=principal.clinician_id))
+    if updated.rowcount != 1:
+        db.rollback()
+        raise HTTPException(409, "assignment invite already used")
+    assignment = db.scalar(select(ClinicianSubjectAssignment).where(
+        ClinicianSubjectAssignment.clinician_id == principal.clinician_id,
+        ClinicianSubjectAssignment.subject_id == invite.subject_id))
+    if assignment is None:
+        try:
+            with db.begin_nested():
+                db.add(ClinicianSubjectAssignment(clinician_id=principal.clinician_id,
+                                                  subject_id=invite.subject_id))
+                db.flush()
+        except IntegrityError:
+            # A different valid invite for the same clinician/subject may have
+            # won the unique-key race. Keep redemption atomic and reactivate it.
+            assignment = db.scalar(select(ClinicianSubjectAssignment).where(
+                ClinicianSubjectAssignment.clinician_id == principal.clinician_id,
+                ClinicianSubjectAssignment.subject_id == invite.subject_id))
+            if assignment is None:
+                raise
+    if assignment is not None:
+        assignment.active = True
+        assignment.assigned_at = now
+        assignment.ended_at = None
+    audit_clinician(db, invite.subject_id, "assignment.accepted", principal)
+    return {"clinician_id": principal.clinician_id, "subject_id": invite.subject_id, "active": True}
 
 
 class ResolveBody(BaseModel):
@@ -323,18 +456,22 @@ class ResolveBody(BaseModel):
 
 @router.post("/v1/attention-events/{event_id}/acknowledge", tags=["attention-events"], response_model=EventResponse)
 def acknowledge(event_id: str, body: EmptyBody, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
-    _assigned_event(db, principal, event_id); now = utcnow()
+    event = _assigned_event(db, principal, event_id); now = utcnow()
     result = db.execute(update(AttentionEvent).where(AttentionEvent.id == event_id, AttentionEvent.status == "OPEN")
         .values(status="ACKNOWLEDGED", acknowledged_at=now, acknowledged_by=principal.clinician_id))
     if result.rowcount != 1: db.rollback(); raise HTTPException(409, "event state has changed")
+    db.add(AuditLog(subject_id=event.subject_id, event="attention.acknowledged",
+                    actor=principal.clinician_id, detail={"event_id": event_id}))
     db.commit(); return {"event": _event_wire(db.get(AttentionEvent, event_id))}
 
 
 @router.post("/v1/attention-events/{event_id}/resolve", tags=["attention-events"], response_model=EventResponse)
 def resolve(event_id: str, body: ResolveBody, db: Session = Depends(get_session), principal: Principal = Depends(require_clinician)):
-    _assigned_event(db, principal, event_id); now = utcnow()
+    event = _assigned_event(db, principal, event_id); now = utcnow()
     result = db.execute(update(AttentionEvent).where(AttentionEvent.id == event_id, AttentionEvent.status == "ACKNOWLEDGED")
         .values(status="RESOLVED", resolved_at=now, resolved_by=principal.clinician_id,
                 resolution_note=body.note))
     if result.rowcount != 1: db.rollback(); raise HTTPException(409, "event state has changed")
+    db.add(AuditLog(subject_id=event.subject_id, event="attention.resolved",
+                    actor=principal.clinician_id, detail={"event_id": event_id}))
     db.commit(); return {"event": _event_wire(db.get(AttentionEvent, event_id))}
