@@ -15,8 +15,10 @@ load_dotenv()
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import conformal
@@ -26,9 +28,9 @@ import identity
 import modality_clients as mc
 import rag_client
 from forecast import persist_c1_forecast_and_event
-from db_models import (AttentionEvent, AuditLog, FusionResult, ModalityReading, PairingCode,
+from db_models import (AttentionEvent, AuditLog, ClinicianSubjectAssignment, ForecastResult, FusionResult, ModalityReading, PairingCode,
                        PatientCredential, Subject, SubjectAlias, Verdict,
-                       get_session, init_db, utcnow, SupportBankNote, SessionLocal)
+                       get_session, init_db, utcnow, SupportBankNote, SessionLocal, engine)
 from clinician_api import (Principal, require_assignment, router as clinician_router,
                            service_or_clinician)
 from patient_auth import (PatientPrincipal, hash_installation_secret,
@@ -91,7 +93,9 @@ def root():
     return {"service": "R26-DS-012 Central Backend", "status": "running", "docs": "/docs"}
 
 def _auth(authorization: Optional[str]):
-    if API_TOKEN and authorization != f"Bearer {API_TOKEN}":
+    if not API_TOKEN:
+        raise HTTPException(503, "service authentication is not configured")
+    if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(401, "invalid or missing bearer token")
 
 
@@ -155,13 +159,14 @@ class ExternalIdRequest(BaseModel):
 @app.post("/v1/subjects/{subject_id}/external-ids", tags=["enrolment"])
 def register_external_id(subject_id: str, req: ExternalIdRequest,
                          db: Session = Depends(get_session),
-                         authorization: Optional[str] = Header(None)):
+                         principal: Optional[Principal] = Depends(service_or_clinician)):
     """Tell the backend what id a given component knows this patient by.
 
     Without this, the backend would ask C2 about a UUID that C2 has never heard
     of. Registering is idempotent: re-registering the same modality updates the
     mapping rather than creating a duplicate alias."""
-    _auth(authorization)
+    if principal is not None:
+        require_assignment(db, principal, subject_id)
     _require_subject(db, subject_id)
     alias_type = EXTERNAL_ID_TYPES.get(req.modality)
     if not alias_type:
@@ -184,7 +189,8 @@ def register_external_id(subject_id: str, req: ExternalIdRequest,
         db.add(SubjectAlias(subject_id=subject_id, alias_type=alias_type,
                             alias_value=req.external_id))
     _audit(db, subject_id, "external_id.registered",
-           {"modality": req.modality, "alias_type": alias_type})
+           {"modality": req.modality, "alias_type": alias_type},
+           principal.clinician_id if principal else "service")
     db.commit()
     return {"subject_id": subject_id, "modality": req.modality,
             "external_id": req.external_id}
@@ -216,6 +222,7 @@ class EnrolResponse(BaseModel):
 class SelfEnrolRequest(BaseModel):
     app_user_id: str = Field(..., pattern=r"^P_[A-F0-9]{16}$")
     installation_secret: str = Field(..., min_length=32, max_length=256)
+    pairing_code: Optional[str] = None
 
 
 class SelfEnrolResponse(BaseModel):
@@ -267,6 +274,23 @@ def self_enrol_subject(req: SelfEnrolRequest, db: Session = Depends(get_session)
 
     credential = db.get(PatientCredential, subject_id)
     if credential is None:
+        if existing:
+            # Existing aliases (including migrated patients) are identifiers,
+            # not proof of ownership. A clinician-issued one-use code authorizes
+            # the *first* credential on an existing subject.
+            code = db.get(PairingCode, (req.pairing_code or "").strip().upper())
+            if not code or code.subject_id != subject_id:
+                raise HTTPException(403, "pairing proof required for existing subject")
+            if code.used_at is not None:
+                raise HTTPException(409, "pairing code already used")
+            if identity.is_expired(code.expires_at):
+                raise HTTPException(410, "pairing code expired")
+            redeemed = db.execute(update(PairingCode).where(
+                PairingCode.code == code.code, PairingCode.used_at.is_(None))
+                .values(used_at=utcnow()))
+            if redeemed.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "pairing code already used")
         credential = PatientCredential(
             subject_id=subject_id,
             secret_hash=hash_installation_secret(req.installation_secret),
@@ -297,14 +321,14 @@ def patient_me(principal: PatientPrincipal = Depends(require_patient)):
 
 @app.post("/v1/subjects", response_model=EnrolResponse, tags=["enrolment"])
 def enrol_subject(req: EnrolRequest, db: Session = Depends(get_session),
-                  authorization: Optional[str] = Header(None)):
+                  principal: Optional[Principal] = Depends(service_or_clinician)):
     """Steps 2-4. Clinician enrols a patient by MRN.
 
     The MRN is HMAC-hashed on arrival and the raw value is never persisted.
     Re-enrolling the same MRN returns the existing subject with a fresh pairing
     code, rather than creating a duplicate patient.
     """
-    _auth(authorization)
+    actor = principal.clinician_id if principal else "service"
     try:
         mrn_hash = identity.hash_mrn(req.mrn)
     except identity.PepperNotConfigured as exc:
@@ -317,14 +341,19 @@ def enrol_subject(req: EnrolRequest, db: Session = Depends(get_session),
 
     if existing:
         subject_id = existing.subject_id
+        if principal is not None:
+            require_assignment(db, principal, subject_id)
         _audit(db, subject_id, "enrol.repeat", {"note": "existing MRN, new pairing code"},
-               req.enrolled_by)
+               actor)
     else:
         subject_id = identity.new_subject_id()
-        db.add(Subject(subject_id=subject_id, enrolled_by=req.enrolled_by))
+        db.add(Subject(subject_id=subject_id, enrolled_by=actor))
         db.add(SubjectAlias(subject_id=subject_id, alias_type="mrn_hash",
                             alias_value=mrn_hash))
-        _audit(db, subject_id, "enrol.created", {"alias": "mrn_hash"}, req.enrolled_by)
+        if principal is not None:
+            db.add(ClinicianSubjectAssignment(clinician_id=principal.clinician_id,
+                                              subject_id=subject_id))
+        _audit(db, subject_id, "enrol.created", {"alias": "mrn_hash"}, actor)
 
     code = identity.new_pairing_code()
     expires = identity.pairing_expiry()
@@ -376,15 +405,18 @@ def pair_subject(req: PairRequest, db: Session = Depends(get_session)):
 @app.get("/v1/subjects/resolve", tags=["enrolment"])
 def resolve_subject(app_user_id: Optional[str] = None, mrn: Optional[str] = None,
                     db: Session = Depends(get_session),
-                    authorization: Optional[str] = Header(None)):
+                    principal: Optional[Principal] = Depends(service_or_clinician)):
     """Look up a subject_id from either alias. The clinician app uses the MRN
     form; the patient app uses app_user_id."""
-    _auth(authorization)
     if app_user_id:
-        return {"subject_id": _resolve(db, "app_user_id", app_user_id)}
-    if mrn:
-        return {"subject_id": _resolve(db, "mrn_hash", identity.hash_mrn(mrn))}
-    raise HTTPException(422, "supply app_user_id or mrn")
+        subject_id = _resolve(db, "app_user_id", app_user_id)
+    elif mrn:
+        subject_id = _resolve(db, "mrn_hash", identity.hash_mrn(mrn))
+    else:
+        raise HTTPException(422, "supply app_user_id or mrn")
+    if principal is not None:
+        require_assignment(db, principal, subject_id)
+    return {"subject_id": subject_id}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -701,6 +733,7 @@ def run_fusion(db: Session, subject_id: str, trigger: str = "manual") -> FusionR
     """Steps 27-31. Gate, fuse, persist. Always re-derived server-side."""
     _require_subject(db, subject_id)
     readings = _latest_readings(db, subject_id)
+    source_reading_ids = {name: data["reading_id"] for name, data in readings.items()}
 
     decision = gate.evaluate(readings)
     assessment = _assessment_summary(decision.usable)
@@ -710,7 +743,8 @@ def run_fusion(db: Session, subject_id: str, trigger: str = "manual") -> FusionR
             subject_id=subject_id, composite=None, tier=None, band="GREY",
             confidence=0.0, modalities_used=len(decision.usable), renormalised=True,
             weights={}, contributions={},
-            harmonisation={"gate": decision.summary(), "assessment": assessment},
+            harmonisation={"gate": decision.summary(), "assessment": assessment,
+                           "source_reading_ids": source_reading_ids},
             reason=decision.reason, trigger=trigger, model_version="gate-blocked")
         db.add(row)
         _audit(db, subject_id, "fusion.blocked", decision.summary())
@@ -721,6 +755,7 @@ def run_fusion(db: Session, subject_id: str, trigger: str = "manual") -> FusionR
     harmonisation = result.get("harmonisation", {})
     harmonisation["gate"] = decision.summary()
     harmonisation["assessment"] = assessment
+    harmonisation["source_reading_ids"] = source_reading_ids
     conf = conformal.predict_set(result.get("composite_score"), _calibration_pairs(db))
     harmonisation["conformal"] = conf.to_wire()
 
@@ -751,9 +786,10 @@ class FuseRequest(BaseModel):
 
 @app.post("/v1/fusion/run", tags=["fusion"])
 def fusion_run(req: FuseRequest, db: Session = Depends(get_session),
-               authorization: Optional[str] = Header(None)):
-    _auth(authorization)
+               principal: Optional[Principal] = Depends(service_or_clinician)):
     subject_id = req.subject_id or _resolve(db, "mrn_hash", identity.hash_mrn(req.mrn or ""))
+    if principal is not None:
+        require_assignment(db, principal, subject_id)
     row = run_fusion(db, subject_id, req.trigger)
     assessment = _assessment_for_row(row)
     return {
@@ -778,28 +814,30 @@ class VerdictRequest(BaseModel):
 
 @app.post("/v1/verdict", tags=["fusion"])
 def record_verdict(req: VerdictRequest, db: Session = Depends(get_session),
-                   authorization: Optional[str] = Header(None)):
+                   principal: Optional[Principal] = Depends(service_or_clinician)):
     """The clinician's HITL tier judgement — the label source for conformal
     calibration and the safety record of every model/clinician disagreement.
 
     Assign the verdict BEFORE looking at the conformal set (the UI must order
     the controls that way), or the label is contaminated by the prediction it
     exists to calibrate."""
-    _auth(authorization)
     if req.tier_label not in conformal.TIERS:
         raise HTTPException(422, f"tier_label must be one of {conformal.TIERS}")
     fr = db.get(FusionResult, req.fusion_result_id)
     if not fr:
         raise HTTPException(404, f"no fusion result {req.fusion_result_id}")
+    if principal is not None:
+        require_assignment(db, principal, fr.subject_id)
+    actor = principal.clinician_id if principal else "service"
 
     v = Verdict(subject_id=fr.subject_id, fusion_result_id=fr.id,
                 tier_label=req.tier_label,
                 agrees_with_model=(fr.tier == req.tier_label) if fr.tier else None,
-                author=req.author, note=req.note)
+                author=actor, note=req.note)
     db.add(v)
     _audit(db, fr.subject_id, "verdict.recorded",
            {"fusion_result_id": fr.id, "clinician_tier": req.tier_label,
-            "model_tier": fr.tier, "agrees": v.agrees_with_model}, req.author)
+            "model_tier": fr.tier, "agrees": v.agrees_with_model}, actor)
     db.commit()
 
     n = len(_calibration_pairs(db))
@@ -836,15 +874,28 @@ def patient_risk(
     assessment = _assessment_for_row(row)
     if not row:
         return {"subject_id": subject_id, "fusion_result_id": None,
-                "composite": None, "band": "GREY",
+                "composite": None, "tier": None, "band": "GREY", "forecast": None,
                 "message": "no assessment yet", "updated_at": None,
                 "assessment_status": assessment["status"],
                 "missing_modalities": assessment["missing_modalities"]}
-    _audit(db, subject_id, "egress.patient", None)
+    now = utcnow()
+    forecast = db.scalar(select(ForecastResult).where(
+        ForecastResult.subject_id == subject_id,
+        ForecastResult.scope == "physiological",
+        ForecastResult.generated_at <= now,
+        ForecastResult.valid_until >= now)
+        .order_by(ForecastResult.generated_at.desc()).limit(1))
+    _audit(db, subject_id, "egress.patient", {"fusion_result_id": row.id},
+           f"patient:{subject_id}" if principal else "service")
     db.commit()
     return {"subject_id": subject_id,
             "fusion_result_id": row.id,
-            "composite": row.composite, "band": row.band,
+            "composite": row.composite, "tier": row.tier, "band": row.band,
+            "forecast": ({"scope": forecast.scope, "horizon_minutes": forecast.horizon_minutes,
+                          "score": forecast.score, "tier": forecast.tier,
+                          "predicted": forecast.escalation_predicted,
+                          "generated_at": forecast.generated_at,
+                          "valid_until": forecast.valid_until} if forecast else None),
             "message": row.reason or "assessment available",
             "updated_at": row.computed_at,
             "assessment_status": assessment["status"],
@@ -896,10 +947,11 @@ def patient_attention_events(
 @app.get("/v1/doctor/patients/{subject_id}/timeline", tags=["egress"])
 def doctor_timeline(subject_id: str, limit: int = 20,
                     db: Session = Depends(get_session),
-                    authorization: Optional[str] = Header(None)):
+                    principal: Optional[Principal] = Depends(service_or_clinician)):
     """Steps 34-35. CLINICIAN view: composite + per-modality scores + freshness
     + status flags + the gate decision + trend history."""
-    _auth(authorization)
+    if principal is not None:
+        require_assignment(db, principal, subject_id)
     _require_subject(db, subject_id)
 
     latest = _latest_fusion(db, subject_id)
@@ -935,7 +987,8 @@ def doctor_timeline(subject_id: str, limit: int = 20,
                          .order_by(FusionResult.computed_at.desc())
                          .limit(limit)).all()
 
-    _audit(db, subject_id, "egress.clinician", None)
+    _audit(db, subject_id, "egress.clinician", None,
+           principal.clinician_id if principal else "service")
     db.commit()
 
     return {
@@ -982,7 +1035,7 @@ class EvidenceRequest(BaseModel):
 @app.post("/v1/doctor/patients/{subject_id}/evidence", tags=["egress"])
 def doctor_evidence(subject_id: str, req: EvidenceRequest,
                     db: Session = Depends(get_session),
-                    authorization: Optional[str] = Header(None)):
+                    principal: Optional[Principal] = Depends(service_or_clinician)):
     """Clinician decision support via CARE-AnxRAG, a separate HTTP service —
     NOT imported into this process (see rag_client.py for why). subject_id is
     used for auth/audit only; per the current integration contract, no patient
@@ -990,7 +1043,8 @@ def doctor_evidence(subject_id: str, req: EvidenceRequest,
     evidence scoring, and abstention — this endpoint's job is to call it
     honestly and never fabricate an answer if it can't be reached.
     """
-    _auth(authorization)
+    if principal is not None:
+        require_assignment(db, principal, subject_id)
     _require_subject(db, subject_id)
 
     result = rag_client.call_rag(req.question)
@@ -1003,7 +1057,7 @@ def doctor_evidence(subject_id: str, req: EvidenceRequest,
            {"available": result.available, "abstained": result.abstained,
             "safety_level": result.safety_level,
             "local_crisis_bypass": result.local_crisis_bypass,
-            "error": result.error})
+            "error": result.error}, principal.clinician_id if principal else "service")
     db.commit()
 
     return {"subject_id": subject_id, **result.to_wire()}
@@ -1035,7 +1089,7 @@ def _carex_fusion_dict(row) -> dict:
 
 @app.get("/v1/doctor/patients/{subject_id}/explanation", tags=["egress"])
 def doctor_explanation(subject_id: str, db: Session = Depends(get_session),
-                       authorization: Optional[str] = Header(None)):
+                       principal: Optional[Principal] = Depends(service_or_clinician)):
     """Why this composite came out the way it did.
 
     Reads only the stored fusion result — no component is re-called — so the
@@ -1044,7 +1098,8 @@ def doctor_explanation(subject_id: str, db: Session = Depends(get_session),
     a clinician reopening yesterday's assessment would see a different rationale
     and stop trusting the number.
     """
-    _auth(authorization)
+    if principal is not None:
+        require_assignment(db, principal, subject_id)
     _require_subject(db, subject_id)
 
     latest = _latest_fusion(db, subject_id)
@@ -1083,7 +1138,8 @@ def doctor_explanation(subject_id: str, db: Session = Depends(get_session),
         _CAREX_THRESHOLDS, _CAREX_REFERENCE_STATUS, _CAREX_BASE_WEIGHTS)
 
     _audit(db, subject_id, "egress.explanation",
-           {"fusion_result_id": latest.id, "explainer": carex.EXPLAINER_VERSION})
+           {"fusion_result_id": latest.id, "explainer": carex.EXPLAINER_VERSION},
+           principal.clinician_id if principal else "service")
     db.commit()
 
     explanation["subject_id"] = subject_id
@@ -1098,9 +1154,8 @@ def doctor_explanation(subject_id: str, db: Session = Depends(get_session),
 def global_evidence(
     req: EvidenceRequest,
     db: Session = Depends(get_session),
-    authorization: Optional[str] = Header(None),
+    principal: Optional[Principal] = Depends(service_or_clinician),
 ):
-    _auth(authorization)
 
     result = rag_client.call_rag(req.question)
 
@@ -1115,6 +1170,7 @@ def global_evidence(
             "local_crisis_bypass": getattr(result, "local_crisis_bypass", False),
             "error": result.error,
         },
+        principal.clinician_id if principal else "service",
     )
     db.commit()
 
@@ -1134,6 +1190,32 @@ def health():
                  "excluded": sorted(gate.EXCLUDED_MODALITIES),
                  "max_age_minutes": gate.MAX_AGE_MINUTES},
     }
+
+
+@app.get("/ready", tags=["ops"])
+def readiness():
+    """Deployment gate: liveness at /health does not imply the schema is usable."""
+    database = "unavailable"
+    revision = None
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            database = "ready"
+            if inspect(conn).has_table("schema_migrations"):
+                revision = conn.execute(text("SELECT revision FROM schema_migrations "
+                                             "ORDER BY revision DESC LIMIT 1")).scalar()
+    except SQLAlchemyError:
+        pass
+    auth = {"clinician": bool(os.getenv("CLINICIAN_JWT_SECRET")),
+            "patient": bool(os.getenv("PATIENT_JWT_SECRET"))}
+    ready = (database == "ready" and revision == "0002_assignment_invites_and_forecast_link"
+             and all(auth.values()) and bool(identity.MRN_PEPPER)
+             and bool(os.getenv("BACKEND_API_TOKEN")))
+    return JSONResponse(status_code=200 if ready else 503,
+                        content={"status": "ready" if ready else "not_ready", "database": database,
+                                 "schema_revision": revision, "auth": auth,
+                                 "mrn_pepper_set": bool(identity.MRN_PEPPER),
+                                 "service_auth": bool(os.getenv("BACKEND_API_TOKEN"))})
 
 
 if __name__ == "__main__":
