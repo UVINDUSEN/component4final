@@ -323,10 +323,18 @@ def roster(db: Session = Depends(get_session), principal: Principal = Depends(re
 
 
 def _event_wire(e):
-    return {key: getattr(e, key) for key in ("id", "subject_id", "fusion_result_id", "forecast_result_id",
+    wire = {key: getattr(e, key) for key in ("id", "subject_id", "fusion_result_id", "forecast_result_id",
         "event_type", "severity", "reason", "forecast_horizon", "status", "created_at",
         "acknowledged_at", "acknowledged_by", "resolved_at", "resolved_by",
         "resolution_note", "policy_version")}
+    # SQLite drops timezone information on reload; PostgreSQL retains it.
+    # Both reads and transitions must expose the same UTC event timestamps.
+    for key in ("created_at", "acknowledged_at", "resolved_at"):
+        value = wire[key]
+        if value is not None:
+            wire[key] = (value.replace(tzinfo=dt.timezone.utc) if value.tzinfo is None
+                         else value.astimezone(dt.timezone.utc))
+    return wire
 
 
 @router.get("/v1/clinicians/me/dashboard", tags=["clinician"])

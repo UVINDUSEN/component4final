@@ -34,13 +34,18 @@ There is intentionally no `/v1/subjects/attach`; clients use
    and gives only its `invite_code` to the clinician. The clinician submits
    `POST /v1/clinicians/me/assignments` with `{"invite_code":"..."}`; the
    response is `{"clinician_id":"DR001","subject_id":"...","active":true}`.
-   Unknown/used/expired codes return 404/409/410. Until both apps wire this
-   addition, an administrator can assign using
+   Unknown/used/expired codes return 404/409/410. Both Aura and ClinAnx now
+   use this patient-issued invite flow. For an administrative recovery case,
+   an operator can assign using
    `python central_backend/manage_assignment.py assign DR001 <subject_id>`.
    Knowing an MRN or app ID alone does not grant access to an existing subject.
 6. Start the service and verify `/health` (liveness), `/ready` (database,
    migration and authentication configuration), `/openapi.json`, login, dashboard,
    assessment, and event lifecycle with an assigned test subject.
+7. Run the local synthetic API rehearsal and the staging/device acceptance steps
+   in [SYNTHETIC_REHEARSAL.md](SYNTHETIC_REHEARSAL.md). A passing local test
+   exercises deterministic component doubles; it does not verify live Spaces,
+   PostgreSQL concurrency, Android builds, or device notification delivery.
 
 Clinician JWTs now authorize the retained doctor timeline/evidence/explanation,
 subject resolve/external-ID, manual fusion, and verdict routes with assignment
