@@ -87,3 +87,37 @@ jobs:
       - name: Run PostgreSQL migration, concurrency and restore gates
         working-directory: central_backend
         run: python -m pytest -q tests/test_postgres_integration.py
+
+  mobile-consumers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AURA_CHECKOUT: ${{ github.workspace }}/consumers/aura
+      CLINANX_CHECKOUT: ${{ github.workspace }}/consumers/clinanx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: DewduSendanayake/anxiety_mobile_app
+          ref: cdef49402f0444fa9d9bcf15d679123df197d5f9
+          path: consumers/aura
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: dulhara79/tcwpn_mobile_app
+          ref: a2b87ef3769c6fcf71323750050bad7c2af61d5a
+          path: consumers/clinanx
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: central_backend/requirements.txt
+      - name: Install backend contract dependencies
+        run: |
+          python -m pip install -r central_backend/requirements.txt
+          python -m pip install -r fusion_service/requirements.txt
+          python -m pip install pytest
+      - name: Verify pinned patient and clinician consumers
+        working-directory: central_backend
+        run: python -m pytest -q tests/test_mobile_consumers.py
