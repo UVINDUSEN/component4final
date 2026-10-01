@@ -51,6 +51,10 @@ production policy threshold or wait is changed.
    deployed revision, a backup/restore, and post-restore event state. Install
    both signed Android builds and complete the real-device smoke checklist.
 
+The `postgres-contract` CI job verifies these database properties with a
+disposable PostgreSQL 16 database and synthetic records. Its dump/restore
+does not replace step 6 using the real staging schema and rollback image.
+
 The local gate proves only the in-process API contract. Mark the integrated
 release accepted only when steps 1–6 have actual deployment/device evidence,
 artifact SHA-256 hashes, and a rollback image recorded in the release sheet.
