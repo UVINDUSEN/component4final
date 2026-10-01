@@ -74,6 +74,8 @@ def _seed_event(sessions):
         for clinician_id in ("DR001", "DR002"):
             db.add(Clinician(clinician_id=clinician_id, display_name=clinician_id,
                              password_hash=hash_password("synthetic-password")))
+        db.flush()
+        for clinician_id in ("DR001", "DR002"):
             db.add(ClinicianSubjectAssignment(clinician_id=clinician_id,
                                               subject_id="subject-postgres"))
         db.flush()
@@ -112,7 +114,8 @@ def test_postgres_v1_upgrade_preserves_rows_and_adds_real_fk(pg_database):
         )"""))
         conn.execute(text("CREATE TABLE schema_migrations (revision varchar(96) PRIMARY KEY)"))
         conn.execute(text("INSERT INTO schema_migrations VALUES ('0001_p0_tables')"))
-        conn.execute(text("INSERT INTO subjects (subject_id) VALUES ('legacy-subject')"))
+        conn.execute(text("INSERT INTO subjects (subject_id, created_at, status) "
+                          "VALUES ('legacy-subject', now(), 'active')"))
         conn.execute(text("INSERT INTO fusion_results (subject_id, confidence, modalities_used, renormalised, computed_at) "
                           "VALUES ('legacy-subject', 0, 0, false, now())"))
         conn.execute(text("""INSERT INTO forecast_results
