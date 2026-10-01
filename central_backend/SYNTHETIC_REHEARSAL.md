@@ -26,6 +26,14 @@ OPEN → ACKNOWLEDGED → RESOLVED with server actor and persistent UTC timestam
 It advances only the synthetic C1 source/forecast clock by 30 seconds; no
 production policy threshold or wait is changed.
 
+The `mobile-consumers` CI job checks out the exact Aura and ClinAnx commits in
+[`contracts/mobile_revisions.json`](contracts/mobile_revisions.json), compares
+their current route use to `/openapi.json`, and validates the clinician fixture
+types and stale/unavailable/event semantics against the backend models. When
+either app changes a consumed route or fixture, update its pinned SHA only
+after the compatibility job passes. This job checks wire compatibility; the
+apps' own Flutter CI remains responsible for widget and build behavior.
+
 ## Staging acceptance with real services and both apps
 
 1. Record the backend and C1/C3/C4/RAG deployment revisions, model/policy
