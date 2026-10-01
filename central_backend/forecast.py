@@ -57,7 +57,12 @@ def _source_window(reading: ModalityReading):
 def persist_c1_forecast_and_event(db, subject_id: str, reading: ModalityReading):
     # PostgreSQL serializes policy evaluation for one subject; the partial
     # unique index remains the final idempotency guard on every database.
-    db.scalar(select(Subject).where(Subject.subject_id == subject_id).with_for_update())
+    # The reading was already inserted with a FK KEY SHARE lock on Subject.
+    # FOR UPDATE would conflict with that lock and two concurrent ingests
+    # could deadlock while each tried to upgrade it. NO KEY UPDATE still
+    # serializes policy writers and is compatible with the FK lock.
+    db.scalar(select(Subject).where(Subject.subject_id == subject_id)
+              .with_for_update(key_share=True))
     if reading.status != "ok": return None, None
     captured = reading.captured_at
     if captured.tzinfo is None: captured = captured.replace(tzinfo=dt.timezone.utc)

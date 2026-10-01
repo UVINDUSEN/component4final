@@ -17,7 +17,10 @@ There is intentionally no `/v1/subjects/attach`; clients use
    assignment invites, and the forecast-to-fusion link, and preserves existing
    patient rows. Run it twice on a staging copy to verify idempotence. Run only
    one migration process at a time; this revision runner has no distributed DDL
-   lock. PostgreSQL lock/FK and concurrency behavior require a staging check.
+   lock. The `postgres-contract` CI job checks a disposable PostgreSQL 16
+   upgrade, concurrent event transitions and episode creation, and a logical
+   dump/restore. Repeat the upgrade and restore with the actual previous
+   staging schema and deployment database settings before release.
 4. Seed a clinician with `python central_backend/seed_clinician.py DR001 "Dr X"`.
 5. A clinician may enrol a new subject and receives the initial assignment.
    Patient self-enrolment of an **existing** subject without a patient credential
