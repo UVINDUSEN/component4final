@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select, text
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import sessionmaker
 
 from clinician_api import hash_password
@@ -222,7 +222,8 @@ def test_postgres_dump_restore_preserves_event_lifecycle(pg_database, tmp_path):
         backup = tmp_path / "synthetic-p0.dump"
         restore_name = f"r26_restore_{uuid.uuid4().hex}"
         env = {**os.environ, "PGPASSWORD": url.password or ""}
-        cli_url = url.set(drivername="postgresql", password=None)
+        cli_url = URL.create("postgresql", username=url.username, host=url.host,
+                             port=url.port, database=url.database, query=url.query)
         restore_url = cli_url.set(database=restore_name)
         admin = create_engine(url, isolation_level="AUTOCOMMIT")
         try:
