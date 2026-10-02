@@ -63,6 +63,10 @@ The `postgres-contract` CI job verifies these database properties with a
 disposable PostgreSQL 16 database and synthetic records. Its dump/restore
 does not replace step 6 using the real staging schema and rollback image.
 
+Use the deployed API verifier in [STAGING_VERIFICATION.md](STAGING_VERIFICATION.md)
+to capture redacted readiness, access, assessment identity and event lifecycle
+observations from the synthetic staging subject.
+
 The local gate proves only the in-process API contract. Mark the integrated
 release accepted only when steps 1–6 have actual deployment/device evidence,
 artifact SHA-256 hashes, and a rollback image recorded in the release sheet.
