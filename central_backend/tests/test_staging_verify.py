@@ -13,7 +13,7 @@ SUBJECT = "synthetic-subject"
 EVENT = "evt_synthetic"
 
 
-def server(*, denied=True, mismatch=False):
+def server(*, denied=True, mismatch=False, unsafe_model=False):
     state = {"status": "OPEN", "writes": 0}
 
     def handler(request):
@@ -42,7 +42,8 @@ def server(*, denied=True, mismatch=False):
                 "current_assessment": {"score": .58, "tier": "Medium", "band": "AMBER"},
                 "forecast": {"scope": "physiological", "valid_until": NOW,
                              "score": .84, "tier": "High", "horizon_minutes": 10},
-                "assessment_status": "complete", "modalities": [], "model_version": "ragf-v0.4"})
+                "assessment_status": "complete", "modalities": [],
+                "model_version": "private patient note" if unsafe_model else "ragf-v0.4"})
         if route == f"/v1/patients/{SUBJECT}/risk":
             return httpx.Response(200, json={"subject_id": SUBJECT,
                 "fusion_result_id": 124 if mismatch else 123, "composite": .58,
@@ -114,12 +115,14 @@ def test_explicit_transition_checks_actor_persistence_and_conflicts():
 
 def test_auth_denial_or_mismatched_patient_identity_blocks_writes():
     for opts, failed in (({"denied": False}, "authentication_and_assignment_denial"),
-                         ({"mismatch": True}, "shared_assessment_identity")):
+                         ({"mismatch": True}, "shared_assessment_identity"),
+                         ({"unsafe_model": True}, "shared_assessment_identity")):
         transport, state = server(**opts)
         result = run(transport, transition=True)
         assert result["result"] == "failed"
         assert result["checks"][-1]["name"] == failed
         assert state["writes"] == 0
+        assert "private patient note" not in json.dumps(result)
 
 
 def test_https_origin_and_cli_credential_fail_closed(tmp_path, monkeypatch, capsys):
