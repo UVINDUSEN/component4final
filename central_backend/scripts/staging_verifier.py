@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 from urllib.parse import quote, urlsplit
@@ -73,6 +74,10 @@ def _timestamp(value: object) -> bool:
         return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is not None
     except ValueError:
         return False
+
+
+def _version(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", value) is not None
 
 
 def verify(client: httpx.Client, *, subject_id: str, event_id: str,
@@ -190,6 +195,7 @@ def verify(client: httpx.Client, *, subject_id: str, event_id: str,
                          for key in ("scope", "horizon_minutes", "score", "tier", "valid_until")),
                      "patient and clinician forecast differs")
         _require(isinstance(a.get("modalities"), list), "modality provenance missing")
+        _require(_version(a.get("model_version")), "model version missing or invalid")
         evidence["model_version"] = a.get("model_version")
         return fid
 
@@ -206,6 +212,7 @@ def verify(client: httpx.Client, *, subject_id: str, event_id: str,
                  and bool(event.get("forecast_result_id")) and bool(event.get("policy_version")),
                  "event source links missing or inconsistent")
         _require(_timestamp(event.get("created_at")), "event creation timestamp missing")
+        _require(_version(event.get("policy_version")), "policy version missing or invalid")
         _require(sum(row.get("id") == event_id for row in listed) == 1,
                  "event list is missing or duplicated")
         matches = [row for row in projected if row.get("id") == event_id]
