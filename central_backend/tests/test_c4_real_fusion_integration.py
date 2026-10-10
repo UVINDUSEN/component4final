@@ -120,7 +120,7 @@ def test_real_local_c4_flows_from_authenticated_patient_to_complete_fusion(monke
         assert c4 is not None and c4.status == "ok"
         assert math.isclose(c4.raw_score, GOLDEN_PROBABILITY, abs_tol=1e-13)
         assert c4.model_version == load_model()["model_version"]
-        assert c4.detail["gad7_total"] == 1
+        assert c4.detail["response"]["gad7_total"] == 1
         assert c4.detail["response"]["score_semantics"] == "calibrated_probability_gad7_ge10"
 
         fusion = db.scalar(
