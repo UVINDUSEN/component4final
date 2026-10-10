@@ -12,8 +12,8 @@ There is intentionally no `/v1/subjects/attach`; clients use
    Supply the actual reviewed C1/C3/C4 and RAG endpoints, not placeholders.
 3. Before starting the new application image, run
    `PYTHONPATH=central_backend python -m central_backend.migrate_p0` from the
-   repository root. It records schema revisions `0001_p0_tables` and
-   `0002_assignment_invites_and_forecast_link`, adds `patient_credentials`,
+   repository root. It records schema revisions `0001_p0_tables`,
+   `0002_assignment_invites_and_forecast_link`, and `0003_push_registry_outbox`, adds `patient_credentials`,
    assignment invites, and the forecast-to-fusion link, and preserves existing
    patient rows. Run it twice on a staging copy to verify idempotence. Run only
    one migration process at a time; this revision runner has no distributed DDL
@@ -96,3 +96,8 @@ Docker build, one-off migration, persistent database, secure seeding and
 synthetic login checks. A running `/health` endpoint alone is not readiness:
 require `/ready` HTTP 200 before testing ClinAnx. Enforce distributed
 `/auth/login` rate limiting at the trusted HTTPS ingress.
+
+8. Optional push delivery is disabled unless configured. Review
+   [PUSH_DELIVERY.md](PUSH_DELIVERY.md) for the notification outbox schema,
+   encrypted device-token registration and FCM worker. Enforce distributed
+   ingress controls using [deploy/nginx_rate_limits.conf.example](deploy/nginx_rate_limits.conf.example).
