@@ -42,7 +42,13 @@ def current_status(db, fusion, *, as_of=None):
         return "unavailable", "fusion evidence no longer usable: " + (decision.reason or "gate failed")
     # The snapshot is a historical immutable composite. If any included
     # component aged out, its stored weighting is no longer valid. Fail closed.
-    originally = {m for m in (fusion.weights or {}) if m not in gate.EXCLUDED_MODALITIES}
+    # fusion.weights contains ALL modality keys, including zero-weight missing ones.
+    # Only positive-weight contributors formed the frozen snapshot; requiring an
+    # absent, zero-weight C4 to be currently usable would hide valid C1+C3
+    # provisional assessments as "unavailable".
+    originally = {m for m, weight in (fusion.weights or {}).items()
+                  if m not in gate.EXCLUDED_MODALITIES
+                  and isinstance(weight, (int, float)) and weight > 0}
     if not originally.issubset(decision.usable):
         return "unavailable", "one or more original fusion contributors expired"
     return base, None
