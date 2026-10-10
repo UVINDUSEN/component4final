@@ -1221,14 +1221,18 @@ def readiness():
         pass
     auth = {"clinician": bool(os.getenv("CLINICIAN_JWT_SECRET")),
             "patient": bool(os.getenv("PATIENT_JWT_SECRET"))}
+    push_enabled = os.getenv("ENABLE_PUSH_NOTIFICATIONS") == "1"
+    push_configured = bool(os.getenv("DEVICE_TOKEN_ENCRYPTION_KEY")) and bool(os.getenv("FCM_PROJECT_ID"))
     ready = (database == "ready" and revision == "0003_push_registry_outbox"
              and all(auth.values()) and bool(identity.MRN_PEPPER)
-             and bool(os.getenv("BACKEND_API_TOKEN")))
+             and bool(os.getenv("BACKEND_API_TOKEN"))
+             and (not push_enabled or push_configured))
     return JSONResponse(status_code=200 if ready else 503,
                         content={"status": "ready" if ready else "not_ready", "database": database,
                                  "schema_revision": revision, "auth": auth,
                                  "mrn_pepper_set": bool(identity.MRN_PEPPER),
-                                 "service_auth": bool(os.getenv("BACKEND_API_TOKEN"))})
+                                 "service_auth": bool(os.getenv("BACKEND_API_TOKEN")),
+                                 "push": {"enabled": push_enabled, "configured": push_configured}})
 
 
 if __name__ == "__main__":
