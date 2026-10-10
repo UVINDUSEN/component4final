@@ -32,6 +32,7 @@ from forecast import needs_confirmation_fusion, persist_c1_forecast_and_event
 from db_models import (AttentionEvent, AuditLog, ClinicianSubjectAssignment, ForecastResult, FusionResult, ModalityReading, PairingCode,
                        PatientCredential, Subject, SubjectAlias, Verdict,
                        get_session, init_db, utcnow, SupportBankNote, SessionLocal, engine)
+from notifications import router as notifications_router
 from clinician_api import (Principal, require_assignment, router as clinician_router,
                            service_or_clinician)
 from patient_auth import (PatientPrincipal, hash_installation_secret,
@@ -74,6 +75,7 @@ app = FastAPI(title="Central Backend — R26-DS-012", version="cb-v1.0", lifespa
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 app.include_router(clinician_router)
+app.include_router(notifications_router)
 
 # Also create tables at import time. The lifespan handler covers `uvicorn main:app`,
 # but a bare TestClient(app) never triggers lifespan, and a missing-table error at
