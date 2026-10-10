@@ -59,6 +59,15 @@ def run_migrations(bind=engine) -> None:
             ])
             conn.execute(insert(_revisions).values(revision="0003_push_registry_outbox"))
 
+    with bind.begin() as conn:
+        applied = set(conn.scalars(select(_revisions)).all())
+        if "0004_encrypted_patient_display_names" not in applied:
+            Base.metadata.create_all(conn, tables=[
+                Base.metadata.tables["patient_display_names"],
+            ])
+            conn.execute(insert(_revisions).values(
+                revision="0004_encrypted_patient_display_names"))
+
 
 if __name__ == "__main__":
     run_migrations()
