@@ -636,8 +636,8 @@ def ingest_contextual(req: ContextualIntake, db: Session = Depends(get_session),
 class ClinicalNote(BaseModel):
     subject_id: Optional[str] = None
     mrn: Optional[str] = None
-    note_text: str
-    note_type: str = "progress"
+    note_text: str = Field(..., min_length=1, max_length=50000)
+    note_type: str = Field("progress", max_length=64)
     anxiety_support: List[str] = Field(default_factory=list)
     control_support: List[str] = Field(default_factory=list)
     # Kaushalya's frozen contract (ARCHITECTURE.md): one unified list of
