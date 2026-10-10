@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r /app/backend-requirements.txt \
     -r /app/fusion-requirements.txt
 
 COPY --chown=user central_backend/*.py /app/central_backend/
+COPY --chown=user central_backend/components/ /app/central_backend/components/
 COPY --chown=user fusion_service/fusion.py fusion_service/harmonise.py /app/fusion_service/
 COPY --chown=user fusion_service/reference/*.json /app/fusion_service/reference/
 

@@ -522,56 +522,34 @@ def call_c3(note_text: str, note_type: str = "progress",
             client.close()
 
 
-# ── C4 demographic (yours) ───────────────────────────────────────────────────
+# ── C4 demographic: local frozen DCAR model ──────────────────────────────────
 def call_c4(subject_id: str, demographics: dict,
             client: Optional[httpx.Client] = None) -> ComponentResult:
-    """POST /fusion_component -> score + confidence + coverage.
+    """Local inference, with original calibrated probability as fusion raw score.
 
-    Called ONCE per patient, at enrolment, when the demographic profile and
-    GAD-7 arrive from the patient app. The score never changes afterwards.
-    This is our own Space (hf_space/app.py) — it already emits the common
-    envelope's status field, so it is trusted verbatim rather than inferred.
+    The GAD-7 questionnaire is NEVER a feature; the baseline-adjusted evidence
+    index stays only in the detail record and is not a clinical probability.
     """
-    if not C4_BASE:
-        return ComponentResult(status="error", note="C4 not configured")
-    own = client is None
-    client = client or httpx.Client()
+    from components.c4.inference import predict_demographics, UnsupportedProfile
     try:
-        r = client.post(f"{C4_BASE}/fusion_component", headers=_headers(C4_TOKEN),
-                        json={"patient_id": subject_id, **(demographics or {})},
-                        timeout=TIMEOUT_S)
-        if r.status_code != 200:
-            return ComponentResult(status="error", note=f"HTTP {r.status_code}")
-        body = r.json()
-        block = body.get("c4_demographic", body)
-        if block.get("score") is None:
-            return ComponentResult(status="error", note="no score field", detail=body)
-
-        status = block.get("status")
-        if not status:
-            status = "ok" if block.get("available", True) else "poor_signal"
-
-        return ComponentResult(
-            raw_score=float(block["score"]) if status == "ok" else None,
-            status=status,
-            confidence=float(block.get("confidence", 0.5)),
-            coverage=float(block.get("coverage", 1.0)),
-            model_version=block.get("model_version", "dcar"), detail=body,
-            note=None if status == "ok" else "coverage too low to be usable",
-            captured_at=_parse_captured_at(block.get("captured_at") or block.get("computed_at"),
-                                           dt.datetime.now(dt.timezone.utc)))
-    except httpx.TimeoutException:
-        return ComponentResult(status="error", note=f"timeout {TIMEOUT_S}s")
-    except Exception as exc:                                # noqa: BLE001
-        return ComponentResult(status="error", note=f"{type(exc).__name__}: {exc}"[:120])
-    finally:
-        if own:
-            client.close()
+        prediction = predict_demographics(demographics)
+    except UnsupportedProfile as exc:
+        return ComponentResult(status="poor_signal", raw_score=None, confidence=0.0,
+                               coverage=0.0, note=str(exc),
+                               model_version="dcar-elasticnet-sigmoid-20260831")
+    except Exception as exc:  # noqa: BLE001
+        return ComponentResult(status="error", raw_score=None, confidence=0.0,
+                               coverage=0.0,
+                               note=f"C4 local inference failed: {type(exc).__name__}: {exc}"[:120])
+    return ComponentResult(
+        raw_score=prediction["demographic_probability"],
+        status="ok", confidence=0.5, coverage=1.0,
+        model_version=prediction["model_version"], detail=prediction)
 
 
 CONFIGURED = {
     "c1_physiological": lambda: bool(C1_BASE),
     "c2_behavioral": lambda: bool(C2_BASE),
     "c3_clinical_nlp": lambda: bool(C3_BASE),
-    "c4_demographic": lambda: bool(C4_BASE),
+    "c4_demographic": lambda: __import__("components.c4.inference", fromlist=["model_available"]).model_available(),
 }
