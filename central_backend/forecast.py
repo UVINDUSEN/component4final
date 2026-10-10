@@ -73,7 +73,37 @@ def _ten_minute_forecast(response: dict):
         if len(horizons) != len(set(map(str, horizons))):
             return None
         if len(values) == 2 and horizons == [5, 10]:
-            target = values[1]
+            # The deployed C1 model defines risk_forecast = forecast * 100.
+            # Explicitly divide by 100 even for values below 1 percent;
+            # the older "divide only if >1" rule could turn 0.8% into 80%.
+            scaled = []
+            for point in values:
+                if isinstance(point, bool):
+                    return None
+                try:
+                    p = float(point)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if not math.isfinite(p) or not 0 <= p <= 100:
+                    return None
+                scaled.append(p / 100.0)
+            # If the source also provides its native probability forecast,
+            # verify the two representations agree rather than trusting a
+            # potentially drifting API contract.
+            native = response.get("forecast")
+            if native is not None:
+                if not isinstance(native, list) or len(native) != 2:
+                    return None
+                for original, converted in zip(native, scaled):
+                    if isinstance(original, bool):
+                        return None
+                    try:
+                        p = float(original)
+                    except (TypeError, ValueError, OverflowError):
+                        return None
+                    if not math.isfinite(p) or not 0 <= p <= 1 or abs(p - converted) > 1e-4:
+                        return None
+            return scaled[1]
         elif len(values) >= 10 and horizons == list(range(1, len(values) + 1)):
             target = values[9]
         else:
@@ -82,8 +112,8 @@ def _ten_minute_forecast(response: dict):
         target = values[9]
     else:
         return None
-    # Reject malformed steps anywhere in the curve; do not cherry-pick a
-    # plausible endpoint from an invalid source prediction.
+    # Legacy 10-step payloads have no declared units. Keep the existing
+    # compatibility behavior; migrate those producers to explicit units.
     for point in values:
         if isinstance(point, bool):
             return None
