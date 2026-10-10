@@ -137,4 +137,4 @@ jobs:
             -e BACKEND_API_TOKEN=ci-only-internal-token \
             -e CLINICIAN_JWT_SECRET=ci-only-clinician-secret \
             -e PATIENT_JWT_SECRET=ci-only-patient-secret \
-            r26-central-ci sh -c 'python migrate_p0.py && python -c "from fastapi.testclient import TestClient; from main import app; r=TestClient(app).get(\"/ready\"); print(r.status_code,r.json()); assert r.status_code == 200"'
+            r26-central-ci sh -c 'python migrate_p0.py && python ci_docker_smoke.py'
