@@ -22,6 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import conformal
+from assessment_freshness import current_status
 import fusion_client
 import gate
 import identity
@@ -878,6 +879,9 @@ def patient_risk(
                 "message": "no assessment yet", "updated_at": None,
                 "assessment_status": assessment["status"],
                 "missing_modalities": assessment["missing_modalities"]}
+    current_state, freshness_reason = current_status(db, row)
+    if freshness_reason and isinstance((row.harmonisation or {}).get("source_reading_ids"), dict):
+        assessment["status"] = "unavailable"
     now = utcnow()
     forecast = db.scalar(select(ForecastResult).where(
         ForecastResult.subject_id == subject_id,
@@ -890,7 +894,9 @@ def patient_risk(
     db.commit()
     return {"subject_id": subject_id,
             "fusion_result_id": row.id,
-            "composite": row.composite, "tier": row.tier, "band": row.band,
+            "composite": row.composite if assessment["status"] != "unavailable" else None,
+            "tier": row.tier if assessment["status"] != "unavailable" else None,
+            "band": row.band if assessment["status"] != "unavailable" else "GREY",
             "forecast": ({"scope": forecast.scope, "horizon_minutes": forecast.horizon_minutes,
                           "score": forecast.score, "tier": forecast.tier,
                           "predicted": forecast.escalation_predicted,
