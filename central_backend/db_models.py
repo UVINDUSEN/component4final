@@ -303,6 +303,37 @@ class AuditLog(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class DeviceToken(Base):
+    """Encrypted FCM token bound to one authenticated app principal."""
+    __tablename__ = "device_tokens"
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_device_token_hash"),)
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    platform: Mapped[str] = mapped_column(String(16), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    registered_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NotificationDelivery(Base):
+    """Durable, idempotent and retryable push-delivery intent."""
+    __tablename__ = "notification_deliveries"
+    __table_args__ = (UniqueConstraint("event_id", "device_id", name="uq_event_device_delivery"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    event_id: Mapped[str] = mapped_column(ForeignKey("attention_events.id"), index=True)
+    device_id: Mapped[str] = mapped_column(ForeignKey("device_tokens.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    claim_id: Mapped[Optional[str]] = mapped_column(String(48))
+    claimed_until: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True))
+    failure_code: Mapped[Optional[str]] = mapped_column(String(32))
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 # ── engine / session ─────────────────────────────────────────────────────────
 _connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=_connect_args, future=True)

@@ -121,3 +121,20 @@ jobs:
       - name: Verify pinned patient and clinician consumers
         working-directory: central_backend
         run: python -m pytest -q tests/test_mobile_consumers.py
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build full in-process fusion backend image
+        run: docker build -f central_backend/Dockerfile -t r26-central-ci .
+      - name: Apply migrations and assert backend readiness
+        run: |
+          docker run --rm \
+            -e DATABASE_URL=sqlite:////data/ci-backend.db \
+            -e MRN_PEPPER=ci-only-pepper \
+            -e BACKEND_API_TOKEN=ci-only-internal-token \
+            -e CLINICIAN_JWT_SECRET=ci-only-clinician-secret \
+            -e PATIENT_JWT_SECRET=ci-only-patient-secret \
+            r26-central-ci sh -c 'python migrate_p0.py && python ci_docker_smoke.py'

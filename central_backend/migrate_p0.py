@@ -50,6 +50,15 @@ def run_migrations(bind=engine) -> None:
                                   "FOREIGN KEY (source_fusion_result_id) REFERENCES fusion_results (id)"))
             conn.execute(insert(_revisions).values(revision="0002_assignment_invites_and_forecast_link"))
 
+    with bind.begin() as conn:
+        applied = set(conn.scalars(select(_revisions)).all())
+        if "0003_push_registry_outbox" not in applied:
+            Base.metadata.create_all(conn, tables=[
+                Base.metadata.tables["device_tokens"],
+                Base.metadata.tables["notification_deliveries"],
+            ])
+            conn.execute(insert(_revisions).values(revision="0003_push_registry_outbox"))
+
 
 if __name__ == "__main__":
     run_migrations()

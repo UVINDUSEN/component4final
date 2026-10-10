@@ -22,15 +22,17 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import conformal
+from assessment_freshness import current_status
 import fusion_client
 import gate
 import identity
 import modality_clients as mc
 import rag_client
-from forecast import persist_c1_forecast_and_event
+from forecast import needs_confirmation_fusion, persist_c1_forecast_and_event
 from db_models import (AttentionEvent, AuditLog, ClinicianSubjectAssignment, ForecastResult, FusionResult, ModalityReading, PairingCode,
                        PatientCredential, Subject, SubjectAlias, Verdict,
                        get_session, init_db, utcnow, SupportBankNote, SessionLocal, engine)
+from notifications import router as notifications_router
 from clinician_api import (Principal, require_assignment, router as clinician_router,
                            service_or_clinician)
 from patient_auth import (PatientPrincipal, hash_installation_secret,
@@ -73,6 +75,7 @@ app = FastAPI(title="Central Backend — R26-DS-012", version="cb-v1.0", lifespa
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 app.include_router(clinician_router)
+app.include_router(notifications_router)
 
 # Also create tables at import time. The lifespan handler covers `uvicorn main:app`,
 # but a bare TestClient(app) never triggers lifespan, and a missing-table error at
@@ -541,7 +544,12 @@ def ingest_physiological(req: PhysiologicalWindow, db: Session = Depends(get_ses
     result = mc.call_c1(c1_user_id)
     row = _store(db, subject_id, "c1_physiological", result)
     db.commit()
-    fusion_info = _auto_fuse(db, subject_id, "physio-ingest", debounce=True)
+    # Normally C1 is debounced to protect the fusion history size. For the
+    # second independent, threshold-crossing forecast window, refresh once so
+    # an attention event can cite the fusion snapshot containing this C1 row.
+    confirmation_due = needs_confirmation_fusion(db, subject_id, row)
+    fusion_info = _auto_fuse(db, subject_id, "physio-confirmation" if confirmation_due
+                             else "physio-ingest", debounce=not confirmation_due)
     forecast, event = persist_c1_forecast_and_event(db, subject_id, row)
     return {"subject_id": subject_id, "reading_id": row.id,
             "status": result.status, "score": result.raw_score, "note": result.note,
@@ -628,8 +636,8 @@ def ingest_contextual(req: ContextualIntake, db: Session = Depends(get_session),
 class ClinicalNote(BaseModel):
     subject_id: Optional[str] = None
     mrn: Optional[str] = None
-    note_text: str
-    note_type: str = "progress"
+    note_text: str = Field(..., min_length=1, max_length=50000)
+    note_type: str = Field("progress", max_length=64)
     anxiety_support: List[str] = Field(default_factory=list)
     control_support: List[str] = Field(default_factory=list)
     # Kaushalya's frozen contract (ARCHITECTURE.md): one unified list of
@@ -878,6 +886,9 @@ def patient_risk(
                 "message": "no assessment yet", "updated_at": None,
                 "assessment_status": assessment["status"],
                 "missing_modalities": assessment["missing_modalities"]}
+    current_state, freshness_reason = current_status(db, row)
+    if freshness_reason and isinstance((row.harmonisation or {}).get("source_reading_ids"), dict):
+        assessment["status"] = "unavailable"
     now = utcnow()
     forecast = db.scalar(select(ForecastResult).where(
         ForecastResult.subject_id == subject_id,
@@ -890,7 +901,9 @@ def patient_risk(
     db.commit()
     return {"subject_id": subject_id,
             "fusion_result_id": row.id,
-            "composite": row.composite, "tier": row.tier, "band": row.band,
+            "composite": row.composite if assessment["status"] != "unavailable" else None,
+            "tier": row.tier if assessment["status"] != "unavailable" else None,
+            "band": row.band if assessment["status"] != "unavailable" else "GREY",
             "forecast": ({"scope": forecast.scope, "horizon_minutes": forecast.horizon_minutes,
                           "score": forecast.score, "tier": forecast.tier,
                           "predicted": forecast.escalation_predicted,
@@ -1208,14 +1221,18 @@ def readiness():
         pass
     auth = {"clinician": bool(os.getenv("CLINICIAN_JWT_SECRET")),
             "patient": bool(os.getenv("PATIENT_JWT_SECRET"))}
-    ready = (database == "ready" and revision == "0002_assignment_invites_and_forecast_link"
+    push_enabled = os.getenv("ENABLE_PUSH_NOTIFICATIONS") == "1"
+    push_configured = bool(os.getenv("DEVICE_TOKEN_ENCRYPTION_KEY")) and bool(os.getenv("FCM_PROJECT_ID"))
+    ready = (database == "ready" and revision == "0003_push_registry_outbox"
              and all(auth.values()) and bool(identity.MRN_PEPPER)
-             and bool(os.getenv("BACKEND_API_TOKEN")))
+             and bool(os.getenv("BACKEND_API_TOKEN"))
+             and (not push_enabled or push_configured))
     return JSONResponse(status_code=200 if ready else 503,
                         content={"status": "ready" if ready else "not_ready", "database": database,
                                  "schema_revision": revision, "auth": auth,
                                  "mrn_pepper_set": bool(identity.MRN_PEPPER),
-                                 "service_auth": bool(os.getenv("BACKEND_API_TOKEN"))})
+                                 "service_auth": bool(os.getenv("BACKEND_API_TOKEN")),
+                                 "push": {"enabled": push_enabled, "configured": push_configured}})
 
 
 if __name__ == "__main__":

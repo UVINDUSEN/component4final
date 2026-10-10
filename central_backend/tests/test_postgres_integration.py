@@ -135,7 +135,7 @@ def test_postgres_v1_upgrade_preserves_rows_and_adds_real_fk(pg_database):
                for fk in inspector.get_foreign_keys("forecast_results"))
     with engine.connect() as conn:
         assert conn.execute(text("SELECT forecast_result_id FROM forecast_results")).scalar_one() == "fcst_legacy"
-        assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 2
+        assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 3
 
 
 def test_postgres_concurrent_lifecycle_and_episode_deduplication(pg_database):
@@ -244,7 +244,7 @@ def test_postgres_dump_restore_preserves_event_lifecycle(pg_database, tmp_path):
                     assert row.status == "RESOLVED"
                     assert row.acknowledged_by == "DR001" and row.resolved_by == "DR002"
                     assert row.acknowledged_at and row.resolved_at
-                    assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 2
+                    assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 3
             finally:
                 restored.dispose()
         finally:

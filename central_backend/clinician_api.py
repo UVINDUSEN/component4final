@@ -10,6 +10,7 @@ import uuid
 from typing import Literal, Optional
 
 import gate
+from assessment_freshness import current_status
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -119,8 +120,8 @@ def audit_clinician(db: Session, subject_id: Optional[str], event: str, principa
 
 
 class LoginRequest(BaseModel):
-    clinician_id: str
-    password: str
+    clinician_id: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=256)
 
 class ClinicianIdentity(BaseModel):
     clinician_id: str; display_name: str; role: Optional[str] = None
@@ -157,18 +158,28 @@ class EventsResponse(BaseModel): events: list[EventWire]
 def login(req: LoginRequest, db: Session = Depends(get_session)):
     clinician = db.get(Clinician, req.clinician_id)
     if not clinician or not clinician.active or not verify_password(req.password, clinician.password_hash):
+        # Do not disclose account existence or submitted credentials in audit.
+        db.add(AuditLog(subject_id=None, event="auth.login.failure", actor="unauthenticated",
+                        detail={"reason": "invalid_credentials"}))
+        db.commit()
         raise HTTPException(401, "invalid credentials")
     if clinician.role.lower() not in {"clinician", "doctor"}:
+        db.add(AuditLog(subject_id=None, event="auth.login.denied", actor=clinician.clinician_id,
+                        detail={"reason": "role_not_permitted"}))
+        db.commit()
         raise HTTPException(403, "account does not have a clinician role")
     secret, issuer, audience = _jwt_settings()
     now = utcnow(); expiry = now + dt.timedelta(seconds=int(os.getenv("CLINICIAN_JWT_TTL_SECONDS", "28800")))
     claims = {"sub": clinician.clinician_id, "clinician_id": clinician.clinician_id,
               "role": clinician.role, "iss": issuer, "aud": audience,
               "iat": int(now.timestamp()), "exp": int(expiry.timestamp()), "jti": uuid.uuid4().hex}
+    token = jwt.encode(claims, secret, algorithm="HS256")
+    db.add(AuditLog(subject_id=None, event="auth.login.success", actor=clinician.clinician_id,
+                    detail={"method": "password"}))
+    db.commit()
     return {"clinician": {"clinician_id": clinician.clinician_id,
                            "display_name": clinician.display_name, "role": clinician.role},
-            "access_token": jwt.encode(claims, secret, algorithm="HS256"),
-            "token_type": "bearer", "expires_at": expiry}
+            "access_token": token, "token_type": "bearer", "expires_at": expiry}
 
 
 @router.get("/v1/me", tags=["clinician-auth"], response_model=Principal)
@@ -260,11 +271,15 @@ def _assessment_wire(db: Session, subject_id: str, row: Optional[FusionResult],
             "exclusion_reason": ("research-only" if name == "c2_behavioral" else
                                  "stale" if not fresh else
                                  r.status if r.status != "ok" else None)})
+    fresh_status, stale_reason = current_status(db, row, as_of=as_of)
+    has_provenance = bool(row and isinstance((row.harmonisation or {}).get("source_reading_ids"), dict))
+    status = fresh_status if not historical and has_provenance else _assessment_status(row)
+    show = bool(row and (historical or status != "unavailable"))
     return {"subject_id": subject_id, "fusion_result_id": row.id if row else None,
-            "current_assessment": ({"score": row.composite, "tier": row.tier, "band": row.band} if row else None),
+            "current_assessment": ({"score": row.composite, "tier": row.tier, "band": row.band} if show else None),
             "forecast": _forecast_wire(_forecast_for_assessment(db, row) if historical and row else
                                        _latest_forecast(db, subject_id, as_of)),
-            "confidence": row.confidence if row else None, "assessment_status": _assessment_status(row),
+            "confidence": row.confidence if show else None, "assessment_status": status,
             "modalities": modalities, "computed_at": row.computed_at if row else None,
             "model_version": row.model_version if row else None}
 
@@ -308,11 +323,15 @@ def _patient_summary(db, sid):
     f = _latest_forecast(db, sid)
     count = len(db.scalars(select(AttentionEvent.id).where(AttentionEvent.subject_id == sid, AttentionEvent.status == "OPEN")).all())
     display_id = "Patient " + hashlib.sha256(f"display-v1:{sid}".encode()).hexdigest()[:8].upper()
+    fresh_status, _ = current_status(db, row)
+    has_provenance = bool(row and isinstance((row.harmonisation or {}).get("source_reading_ids"), dict))
+    status = fresh_status if has_provenance else _assessment_status(row)
+    show = bool(row and status != "unavailable")
     return {"subject_id": sid, "display_id": display_id, "fusion_result_id": row.id if row else None,
-            "current": {"score": row.composite if row else None, "tier": row.tier if row else None},
+            "current": {"score": row.composite if show else None, "tier": row.tier if show else None},
             "forecast": ({"score": f.score, "tier": f.tier, "horizon_minutes": f.horizon_minutes,
                           "predicted": f.escalation_predicted, "escalation_predicted": f.escalation_predicted} if f else None),
-            "assessment_status": _assessment_status(row), "last_updated": row.computed_at if row else None,
+            "assessment_status": status, "last_updated": row.computed_at if row else None,
             "open_event_count": count}
 
 
