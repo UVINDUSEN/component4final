@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 from sqlalchemy import select
 
+from notifications import queue_event_delivery
+
 from db_models import (AttentionEvent, AuditLog, EscalationEpisode, ForecastResult,
                        FusionResult, ModalityReading, Subject, utcnow)
 
@@ -234,6 +236,8 @@ def persist_c1_forecast_and_event(db, subject_id: str, reading: ModalityReading)
                 severity="high", reason="Forecast crossed versioned escalation policy",
                 forecast_horizon=10, policy_version=POLICY.version)
             db.add(event)
+            db.flush()
+            queue_event_delivery(db, event)
             db.add(AuditLog(subject_id=subject_id, event="attention.created", actor=f"policy:{POLICY.version}",
                             detail={"event_id": event.id, "fusion_result_id": fusion.id,
                                     "forecast_result_id": forecast.forecast_result_id}))
