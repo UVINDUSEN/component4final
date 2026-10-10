@@ -54,6 +54,41 @@ def _source_window(reading: ModalityReading):
     return timestamp if abs((timestamp - captured).total_seconds()) <= 1 else None
 
 
+
+def _ten_minute_forecast(response: dict):
+    """Extract the 10-minute endpoint from either published C1 wire shape.
+
+    A two-point [5, 10]-minute payload MUST declare its horizons; otherwise
+    interpreting its second point as 10 minutes is an unsupported assumption.
+    """
+    values = response.get("risk_forecast")
+    if not isinstance(values, list) or not values:
+        return None
+    horizons = response.get("forecast_horizons_minutes")
+    if horizons is not None:
+        if not isinstance(horizons, list) or len(horizons) != len(values):
+            return None
+        if len(horizons) != len(set(map(str, horizons))):
+            return None
+        if len(values) == 2 and horizons == [5, 10]:
+            target = values[1]
+        elif len(values) >= 10 and horizons == list(range(1, len(values) + 1)):
+            target = values[9]
+        else:
+            return None
+    elif len(values) >= 10:
+        target = values[9]
+    else:
+        return None
+    if isinstance(target, bool):
+        return None
+    try:
+        score = _normalise(target)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return score if score is not None and math.isfinite(score) and 0 <= score <= 1 else None
+
+
 def persist_c1_forecast_and_event(db, subject_id: str, reading: ModalityReading):
     # PostgreSQL serializes policy evaluation for one subject; the partial
     # unique index remains the final idempotency guard on every database.
@@ -92,18 +127,9 @@ def persist_c1_forecast_and_event(db, subject_id: str, reading: ModalityReading)
             db.commit()
         return None, None
     response = ((reading.detail or {}).get("response") or {})
-    values = response.get("risk_forecast")
-    if not isinstance(values, list) or len(values) < 10:
+    score = _ten_minute_forecast(response)
+    if score is None:
         return unavailable()
-    try:
-        scores = [_normalise(value) if not isinstance(value, bool) else None
-                  for value in values[:10]]
-    except (TypeError, ValueError, OverflowError):
-        return unavailable()
-    if any(value is None or not math.isfinite(value) or not 0 <= value <= 1
-            for value in scores):
-        return unavailable()
-    score = scores[9]
     predicted = score >= POLICY.forecast_threshold and score-current >= POLICY.minimum_increase
     fusion = db.scalar(select(FusionResult).where(FusionResult.subject_id == subject_id)
         .order_by(FusionResult.computed_at.desc(), FusionResult.id.desc()).limit(1))
