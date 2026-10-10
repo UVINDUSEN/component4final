@@ -1221,7 +1221,7 @@ def readiness():
         pass
     auth = {"clinician": bool(os.getenv("CLINICIAN_JWT_SECRET")),
             "patient": bool(os.getenv("PATIENT_JWT_SECRET"))}
-    ready = (database == "ready" and revision == "0002_assignment_invites_and_forecast_link"
+    ready = (database == "ready" and revision == "0003_push_registry_outbox"
              and all(auth.values()) and bool(identity.MRN_PEPPER)
              and bool(os.getenv("BACKEND_API_TOKEN")))
     return JSONResponse(status_code=200 if ready else 503,
