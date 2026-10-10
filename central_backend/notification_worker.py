@@ -16,7 +16,7 @@ from cryptography.fernet import Fernet
 from sqlalchemy import or_, select
 
 from db_models import (
-    AttentionEvent, AuditLog, DeviceToken, NotificationDelivery,
+    AttentionEvent, AuditLog, ClinicianSubjectAssignment, DeviceToken, NotificationDelivery,
     SessionLocal, utcnow,
 )
 
@@ -86,8 +86,19 @@ def dispatch_once(limit: int = 25, sender=_send_fcm) -> dict:
             event_created = event.created_at if event else None
             if event_created is not None and event_created.tzinfo is None:
                 event_created = event_created.replace(tzinfo=dt.timezone.utc)
+            # Recheck recipient authorization at delivery time, not only when
+            # queued: a token may change owners or an assignment may be revoked.
+            allowed = False
+            if device is not None and event is not None:
+                if device.owner_kind == "patient":
+                    allowed = device.owner_id == event.subject_id
+                elif device.owner_kind == "clinician":
+                    allowed = db.scalar(select(ClinicianSubjectAssignment.id).where(
+                        ClinicianSubjectAssignment.subject_id == event.subject_id,
+                        ClinicianSubjectAssignment.clinician_id == device.owner_id,
+                        ClinicianSubjectAssignment.active.is_(True))) is not None
             # Never send notifications about old, resolved or cancelled events.
-            if (not device or not device.active or not event or event.status != "OPEN"
+            if (not allowed or not device or not device.active or not event or event.status != "OPEN"
                     or not event_created or now - event_created > dt.timedelta(minutes=10)):
                 delivery.status, delivery.claimed_until = "skipped", None
                 db.commit()
