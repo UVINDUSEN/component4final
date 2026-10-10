@@ -323,11 +323,15 @@ def _patient_summary(db, sid):
     f = _latest_forecast(db, sid)
     count = len(db.scalars(select(AttentionEvent.id).where(AttentionEvent.subject_id == sid, AttentionEvent.status == "OPEN")).all())
     display_id = "Patient " + hashlib.sha256(f"display-v1:{sid}".encode()).hexdigest()[:8].upper()
+    fresh_status, _ = current_status(db, row)
+    has_provenance = bool(row and isinstance((row.harmonisation or {}).get("source_reading_ids"), dict))
+    status = fresh_status if has_provenance else _assessment_status(row)
+    show = bool(row and status != "unavailable")
     return {"subject_id": sid, "display_id": display_id, "fusion_result_id": row.id if row else None,
-            "current": {"score": row.composite if row else None, "tier": row.tier if row else None},
+            "current": {"score": row.composite if show else None, "tier": row.tier if show else None},
             "forecast": ({"score": f.score, "tier": f.tier, "horizon_minutes": f.horizon_minutes,
                           "predicted": f.escalation_predicted, "escalation_predicted": f.escalation_predicted} if f else None),
-            "assessment_status": _assessment_status(row), "last_updated": row.computed_at if row else None,
+            "assessment_status": status, "last_updated": row.computed_at if row else None,
             "open_event_count": count}
 
 
