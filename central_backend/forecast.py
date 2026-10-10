@@ -80,8 +80,17 @@ def _ten_minute_forecast(response: dict):
         target = values[9]
     else:
         return None
-    if isinstance(target, bool):
-        return None
+    # Reject malformed steps anywhere in the curve; do not cherry-pick a
+    # plausible endpoint from an invalid source prediction.
+    for point in values:
+        if isinstance(point, bool):
+            return None
+        try:
+            normalised = _normalise(point)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if normalised is None or not math.isfinite(normalised) or not 0 <= normalised <= 1:
+            return None
     try:
         score = _normalise(target)
     except (TypeError, ValueError, OverflowError):
