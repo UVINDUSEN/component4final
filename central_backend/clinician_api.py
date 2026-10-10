@@ -10,6 +10,7 @@ import uuid
 from typing import Literal, Optional
 
 import gate
+from assessment_freshness import current_status
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -270,11 +271,15 @@ def _assessment_wire(db: Session, subject_id: str, row: Optional[FusionResult],
             "exclusion_reason": ("research-only" if name == "c2_behavioral" else
                                  "stale" if not fresh else
                                  r.status if r.status != "ok" else None)})
+    fresh_status, stale_reason = current_status(db, row, as_of=as_of)
+    has_provenance = bool(row and isinstance((row.harmonisation or {}).get("source_reading_ids"), dict))
+    status = fresh_status if not historical and has_provenance else _assessment_status(row)
+    show = bool(row and (historical or status != "unavailable"))
     return {"subject_id": subject_id, "fusion_result_id": row.id if row else None,
-            "current_assessment": ({"score": row.composite, "tier": row.tier, "band": row.band} if row else None),
+            "current_assessment": ({"score": row.composite, "tier": row.tier, "band": row.band} if show else None),
             "forecast": _forecast_wire(_forecast_for_assessment(db, row) if historical and row else
                                        _latest_forecast(db, subject_id, as_of)),
-            "confidence": row.confidence if row else None, "assessment_status": _assessment_status(row),
+            "confidence": row.confidence if show else None, "assessment_status": status,
             "modalities": modalities, "computed_at": row.computed_at if row else None,
             "model_version": row.model_version if row else None}
 
