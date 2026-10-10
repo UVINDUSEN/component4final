@@ -20,7 +20,7 @@ def test_readiness_checks_schema_database_and_patient_and_clinician_secrets(monk
     ready = client.get("/ready")
     assert ready.status_code == 200
     assert ready.json()["database"] == "ready"
-    assert ready.json()["schema_revision"] == "0002_assignment_invites_and_forecast_link"
+    assert ready.json()["schema_revision"] == "0003_push_registry_outbox"
     assert ready.json()["auth"] == {"clinician": True, "patient": True}
     monkeypatch.delenv("PATIENT_JWT_SECRET")
     assert client.get("/ready").status_code == 503
