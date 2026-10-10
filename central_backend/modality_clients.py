@@ -8,7 +8,8 @@ layer can be re-run over stored readings at any time without re-calling anyone.
 
 The adapters follow the contracts exposed by the live component services:
 
-    c1_physiological  GET /predict/{user_id} -> current_risk_index [0,100]
+    c1_physiological  GET /predict/{user_id} -> normalized score [0,1]
+                       (current_risk_index is a 0-100 display index)
 
     c2_behavioral     excluded — stored, never fused, no Space called
 
@@ -225,7 +226,8 @@ def _call_c1_legacy(client: httpx.Client, user_id: str) -> ComponentResult:
     3. Coverage is NOT len(risk_forecast)/10 — C1 always returns 10 steps
        regardless of real history (padded with baseline). Record as unknown.
     4. confidence is NOT a C1 field. Record 0.5, not an estimate.
-    5. model_version is NOT published by this contract. Record None.
+    5. model_version is NOT published by the legacy contract. Record None.
+    6. C1 display index [0,100] must be converted to fusion score [0,1].
     """
     r = client.get(f"{C1_BASE}/predict/{user_id}",
                    headers=_headers(C1_TOKEN), timeout=TIMEOUT_S)
@@ -244,15 +246,55 @@ def _call_c1_legacy(client: httpx.Client, user_id: str) -> ComponentResult:
     else:
         our_status = "error"
 
-    risk_index = body.get("current_risk_index")
-    if our_status == "ok" and risk_index is None:
-        our_status = "error"
-
-    raw_score = float(risk_index) if our_status == "ok" else None
+    # The C1 service returns `current_c1_score` and `score` on [0,1],
+    # plus `current_risk_index = current_c1_score * 100` for display.
+    # NEVER feed the 0-100 display index into the 0-1 fusion reference.
+    raw_score = None
+    score_source = None
+    score_issue = None
+    if our_status == "ok":
+        try:
+            normalized = body.get("current_c1_score")
+            score_source = "current_c1_score"
+            if normalized is None:
+                normalized = body.get("score")
+                score_source = "score"
+            risk_index = body.get("current_risk_index")
+            if normalized is not None:
+                if isinstance(normalized, bool):
+                    raise ValueError("boolean normalized score")
+                candidate = float(normalized)
+                if not math.isfinite(candidate) or not 0.0 <= candidate <= 1.0:
+                    raise ValueError("normalized score outside [0,1]")
+                if risk_index is not None:
+                    if isinstance(risk_index, bool):
+                        raise ValueError("boolean current_risk_index")
+                    display = float(risk_index)
+                    if (not math.isfinite(display) or not 0.0 <= display <= 100.0
+                            or abs(display / 100.0 - candidate) > 1e-4):
+                        raise ValueError("C1 score fields disagree about units")
+                raw_score = candidate
+            elif risk_index is not None:
+                if isinstance(risk_index, bool):
+                    raise ValueError("boolean current_risk_index")
+                display = float(risk_index)
+                if not math.isfinite(display) or not 0.0 <= display <= 100.0:
+                    raise ValueError("current_risk_index outside [0,100]")
+                raw_score = display / 100.0
+                score_source = "current_risk_index / 100"
+            else:
+                raise ValueError("no C1 numeric score field")
+        except (TypeError, ValueError, OverflowError) as exc:
+            our_status = "error"
+            score_issue = str(exc)
 
     note_parts = [f"C1 status='{c1_status}'"]
     if our_status != "ok":
-        note_parts.append(body.get("message", "")[:120])
+        note_parts.append(str(body.get("message") or "")[:120])
+    if score_issue:
+        note_parts.append("C1 scale validation failed: " + score_issue)
+    if score_source and our_status == "ok":
+        note_parts.append(f"normalized C1 score from {score_source}")
     note_parts.append("coverage: unknown (C1 pads history; len(forecast) always 10)")
 
     captured = _parse_captured_at(
