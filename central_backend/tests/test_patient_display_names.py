@@ -114,7 +114,7 @@ def test_patient_auth_and_assignment_boundaries_and_input_validation():
     assert c.put("/v1/patients/me/display-name", headers=a,
                  json={"display_name": "  "}).status_code == 422
     assert c.put("/v1/patients/me/display-name", headers=a,
-                 json={"display_name": "bad\\nname"}).status_code == 422
+                 json={"display_name": "bad\nname"}).status_code == 422
     assert c.put("/v1/patients/me/display-name", headers=a,
                  json={"display_name": "X" * 81}).status_code == 422
 
