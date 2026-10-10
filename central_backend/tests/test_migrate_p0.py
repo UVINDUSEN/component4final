@@ -23,7 +23,7 @@ def test_upgrade_existing_forecasts_is_versioned_idempotent_and_preserves_rows(t
     assert "source_fusion_result_id" in {column["name"] for column in inspector.get_columns("forecast_results")}
     with engine.connect() as conn:
         assert conn.execute(text("SELECT forecast_result_id FROM forecast_results")).scalar_one() == "fcst_old"
-        assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 2
+        assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 3
 
 
 def test_clean_database_bootstraps_core_schema_before_p0_tables(tmp_path):
