@@ -261,7 +261,9 @@ def _assessment_wire(db: Session, subject_id: str, row: Optional[FusionResult],
         max_age = MAX_AGE_MINUTES[name]
         age = max(0.0, (now-captured).total_seconds() / 60)
         fresh = max_age is None or age <= max_age
-        included = bool(row and name != "c2_behavioral" and name in (row.weights or {})
+        included = bool(row and name != "c2_behavioral"
+                        and isinstance((row.weights or {}).get(name), (int, float))
+                        and (row.weights or {}).get(name, 0) > 0
                         and (snapshot is None or snapshot.get(name) == r.id))
         modalities.append({"component_id": name, "score": r.raw_score, "available": r.status == "ok" and fresh,
             "included_in_fusion": included, "status": r.status if fresh else "stale",
