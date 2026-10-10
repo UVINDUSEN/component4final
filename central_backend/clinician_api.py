@@ -157,18 +157,28 @@ class EventsResponse(BaseModel): events: list[EventWire]
 def login(req: LoginRequest, db: Session = Depends(get_session)):
     clinician = db.get(Clinician, req.clinician_id)
     if not clinician or not clinician.active or not verify_password(req.password, clinician.password_hash):
+        # Do not disclose account existence or submitted credentials in audit.
+        db.add(AuditLog(subject_id=None, event="auth.login.failure", actor="unauthenticated",
+                        detail={"reason": "invalid_credentials"}))
+        db.commit()
         raise HTTPException(401, "invalid credentials")
     if clinician.role.lower() not in {"clinician", "doctor"}:
+        db.add(AuditLog(subject_id=None, event="auth.login.denied", actor=clinician.clinician_id,
+                        detail={"reason": "role_not_permitted"}))
+        db.commit()
         raise HTTPException(403, "account does not have a clinician role")
     secret, issuer, audience = _jwt_settings()
     now = utcnow(); expiry = now + dt.timedelta(seconds=int(os.getenv("CLINICIAN_JWT_TTL_SECONDS", "28800")))
     claims = {"sub": clinician.clinician_id, "clinician_id": clinician.clinician_id,
               "role": clinician.role, "iss": issuer, "aud": audience,
               "iat": int(now.timestamp()), "exp": int(expiry.timestamp()), "jti": uuid.uuid4().hex}
+    token = jwt.encode(claims, secret, algorithm="HS256")
+    db.add(AuditLog(subject_id=None, event="auth.login.success", actor=clinician.clinician_id,
+                    detail={"method": "password"}))
+    db.commit()
     return {"clinician": {"clinician_id": clinician.clinician_id,
                            "display_name": clinician.display_name, "role": clinician.role},
-            "access_token": jwt.encode(claims, secret, algorithm="HS256"),
-            "token_type": "bearer", "expires_at": expiry}
+            "access_token": token, "token_type": "bearer", "expires_at": expiry}
 
 
 @router.get("/v1/me", tags=["clinician-auth"], response_model=Principal)

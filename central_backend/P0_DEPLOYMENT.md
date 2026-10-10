@@ -21,7 +21,21 @@ There is intentionally no `/v1/subjects/attach`; clients use
    upgrade, concurrent event transitions and episode creation, and a logical
    dump/restore. Repeat the upgrade and restore with the actual previous
    staging schema and deployment database settings before release.
-4. Seed a clinician with `python central_backend/seed_clinician.py DR001 "Dr X"`.
+4. **After migrations, provision a clinician on the same DATABASE_URL the API uses.**
+   Explicitly configure DATABASE_URL first; the seeding CLI refuses to run without
+   it. Use a hidden interactive password of at least 12 characters:
+
+   ```sh
+   cd central_backend
+   python seed_clinician.py DR001 "Dr X"
+   # Existing accounts are not overwritten unless explicitly requested:
+   python seed_clinician.py DR001 "Dr X" --rotate-password
+   ```
+
+   IDs are case-sensitive. `AUTH_LOCAL` is debug-only Flutter configuration,
+   not a backend account store. Do not pass passwords as command arguments,
+   store them in Git, or post credentials in team chats. For approved automation,
+   use `--password-stdin` with secret-injection tooling.
 5. A clinician may enrol a new subject and receives the initial assignment.
    Patient self-enrolment of an **existing** subject without a patient credential
    (including migrated records) now requires `pairing_code` in the
@@ -73,3 +87,12 @@ registration in the clinician app until a separate push contract is agreed.
 
 Deploy the database additions before the application. Roll back by restoring the
 database backup and previous application image; do not drop P0 tables in-place.
+
+
+## Container and clinician login preflight
+
+See [DEPLOYMENT_PREFLIGHT.md](DEPLOYMENT_PREFLIGHT.md) for the root-context
+Docker build, one-off migration, persistent database, secure seeding and
+synthetic login checks. A running `/health` endpoint alone is not readiness:
+require `/ready` HTTP 200 before testing ClinAnx. Enforce distributed
+`/auth/login` rate limiting at the trusted HTTPS ingress.
