@@ -20,10 +20,12 @@ def test_password_stdin_requires_minimum_length(monkeypatch):
         seed_clinician._password_from_operator(True)
 
 
-def test_seed_requires_explicit_database_url(monkeypatch):
+def test_seed_requires_explicit_database_url(monkeypatch, capsys):
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    with pytest.raises(SystemExit, match="DATABASE_URL"):
+    with pytest.raises(SystemExit) as exc:
         seed_clinician.main(["DRTEST", "Dr Test"])
+    assert exc.value.code == 2
+    assert "DATABASE_URL" in capsys.readouterr().err
 
 
 def test_password_rotation_is_explicit_and_preserves_role(monkeypatch):
