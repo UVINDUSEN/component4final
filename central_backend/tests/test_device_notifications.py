@@ -69,3 +69,22 @@ def test_device_registration_and_scoped_delivery(monkeypatch):
 
     assert client.delete(f"/v1/device-tokens/{patient_device_id}", headers=patient).status_code == 204
     assert client.get("/v1/device-tokens", headers=patient).json()["devices"] == []
+
+    from notification_worker import dispatch_once
+
+    monkeypatch.setenv("ENABLE_PUSH_NOTIFICATIONS", "1")
+    monkeypatch.setenv("FCM_PROJECT_ID", "synthetic-fcm-project")
+    sent = []
+
+    def synthetic_sender(token, event):
+        sent.append((token, event.id))
+        return 200
+
+    result = dispatch_once(sender=synthetic_sender)
+    assert result["sent"] == 1
+    assert result["skipped"] == 1  # the revoked patient device is fail-closed
+    assert sent == [("synthetic-clinician-device-token-123", "evt_notify_test")]
+    with SessionLocal() as db:
+        statuses = sorted(db.scalars(select(NotificationDelivery.status).where(
+            NotificationDelivery.event_id == "evt_notify_test")).all())
+        assert statuses == ["sent", "skipped"]
