@@ -28,7 +28,7 @@ import gate
 import identity
 import modality_clients as mc
 import rag_client
-from forecast import persist_c1_forecast_and_event
+from forecast import needs_confirmation_fusion, persist_c1_forecast_and_event
 from db_models import (AttentionEvent, AuditLog, ClinicianSubjectAssignment, ForecastResult, FusionResult, ModalityReading, PairingCode,
                        PatientCredential, Subject, SubjectAlias, Verdict,
                        get_session, init_db, utcnow, SupportBankNote, SessionLocal, engine)
@@ -542,7 +542,12 @@ def ingest_physiological(req: PhysiologicalWindow, db: Session = Depends(get_ses
     result = mc.call_c1(c1_user_id)
     row = _store(db, subject_id, "c1_physiological", result)
     db.commit()
-    fusion_info = _auto_fuse(db, subject_id, "physio-ingest", debounce=True)
+    # Normally C1 is debounced to protect the fusion history size. For the
+    # second independent, threshold-crossing forecast window, refresh once so
+    # an attention event can cite the fusion snapshot containing this C1 row.
+    confirmation_due = needs_confirmation_fusion(db, subject_id, row)
+    fusion_info = _auto_fuse(db, subject_id, "physio-confirmation" if confirmation_due
+                             else "physio-ingest", debounce=not confirmation_due)
     forecast, event = persist_c1_forecast_and_event(db, subject_id, row)
     return {"subject_id": subject_id, "reading_id": row.id,
             "status": result.status, "score": result.raw_score, "note": result.note,
