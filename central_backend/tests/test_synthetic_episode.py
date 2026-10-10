@@ -92,7 +92,9 @@ def test_synthetic_episode_from_patient_invite_to_persisted_resolution(monkeypat
     # The clock moves 30 seconds between independent source-stamped C1 windows.
     # No sleep or production clock/policy changes are needed for this rehearsal.
     now = utcnow()
-    windows = [now - dt.timedelta(seconds=30), now, now + dt.timedelta(seconds=1)]
+    # Confirmation preflight and policy evaluation each read the policy clock.
+    windows = [now - dt.timedelta(seconds=30), now, now,
+               now + dt.timedelta(seconds=1), now + dt.timedelta(seconds=2)]
     monkeypatch.setattr(forecast, "utcnow", lambda: windows.pop(0))
     c1_windows = [now - dt.timedelta(seconds=30), now, now]
 
