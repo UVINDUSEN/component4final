@@ -38,3 +38,10 @@ Use HTTPS externally and configure **distributed rate limiting** at the trusted
 ingress for `/auth/login`. A per-process counter is not sufficient with
 multiple workers/replicas. Do not log raw passwords, JWTs, private DB URLs,
 participant data or password hashes. Use only synthetic test identities.
+
+## Optional phase-7 notifications
+
+Revision `0003_push_registry_outbox` is required for this build's `/ready`.
+See [PUSH_DELIVERY.md](PUSH_DELIVERY.md). Push is disabled by default; do not
+claim device delivery until Firebase credentials, both app token registrations,
+worker scheduling and physical-device tests succeed.
