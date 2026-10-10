@@ -120,8 +120,8 @@ def audit_clinician(db: Session, subject_id: Optional[str], event: str, principa
 
 
 class LoginRequest(BaseModel):
-    clinician_id: str
-    password: str
+    clinician_id: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=256)
 
 class ClinicianIdentity(BaseModel):
     clinician_id: str; display_name: str; role: Optional[str] = None
