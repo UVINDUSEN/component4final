@@ -864,8 +864,8 @@ mc.C1_BASE = _old_c1_base
 check("C1 prediction uses GET /predict/{participant_id}",
       _c1_client.get_urls == ["https://c1.example/predict/P_ABCDEF0123456789"])
 check("C1 prediction never POSTs incomplete feature data", not _c1_client.post_urls)
-check("C1 current_risk_index is parsed from the live response",
-      _c1_result.status == "ok" and _c1_result.raw_score == 37.5)
+check("C1 display index is correctly normalized for fusion",
+      _c1_result.status == "ok" and abs(_c1_result.raw_score - 0.375) < 1e-12)
 
 # The central ingest endpoint must prefer the patient app's P_ id over our UUID
 # and must not pass the old three-value pseudo-window into the C1 client.
