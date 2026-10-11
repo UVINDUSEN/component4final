@@ -22,6 +22,8 @@ from db_models import (AttentionEvent, AuditLog, Clinician, ClinicianAssignmentI
                        ForecastResult, FusionResult, ModalityReading, Subject,
                        get_session, utcnow)
 from patient_auth import PatientPrincipal, require_patient
+from patient_display_names import encrypt_display_name, shared_display_name
+from db_models import PatientDisplayName
 
 router = APIRouter()
 ALL_MODALITIES = ["c1_physiological", "c2_behavioral", "c3_clinical_nlp", "c4_demographic"]
@@ -329,7 +331,7 @@ def _patient_summary(db, sid):
     has_provenance = bool(row and isinstance((row.harmonisation or {}).get("source_reading_ids"), dict))
     status = fresh_status if has_provenance else _assessment_status(row)
     show = bool(row and status != "unavailable")
-    return {"subject_id": sid, "display_id": display_id, "fusion_result_id": row.id if row else None,
+    return {"subject_id": sid, "display_id": display_id, "patient_name": shared_display_name(db, sid), "fusion_result_id": row.id if row else None,
             "current": {"score": row.composite if show else None, "tier": row.tier if show else None},
             "forecast": ({"score": f.score, "tier": f.tier, "horizon_minutes": f.horizon_minutes,
                           "predicted": f.escalation_predicted, "escalation_predicted": f.escalation_predicted} if f else None),
@@ -393,6 +395,60 @@ def event_detail(event_id: str, db: Session = Depends(get_session), principal: P
     event = _assigned_event(db, principal, event_id)
     audit_clinician(db, event.subject_id, "attention.read", principal, {"event_id": event_id})
     return {"event": _event_wire(event)}
+
+
+class PatientDisplayNameBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    display_name: str = Field(..., min_length=1, max_length=80)
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        import unicodedata
+        if any(unicodedata.category(char).startswith("C") for char in value):
+            raise ValueError("display_name cannot contain control characters")
+        name = " ".join(value.strip().split())
+        if not name or len(name) > 80:
+            raise ValueError("display_name must be 1-80 visible characters")
+        return name
+
+
+@router.put("/v1/patients/me/display-name", tags=["patient-auth"])
+def share_patient_display_name(
+    body: PatientDisplayNameBody,
+    principal: PatientPrincipal = Depends(require_patient),
+    db: Session = Depends(get_session),
+):
+    # Patient JWT fixes subject_id. Caller cannot set another subject_id.
+    encrypted = encrypt_display_name(body.display_name)
+    existing = db.get(PatientDisplayName, principal.subject_id)
+    if existing is None:
+        db.add(PatientDisplayName(
+            subject_id=principal.subject_id, encrypted_name=encrypted))
+    else:
+        existing.encrypted_name = encrypted
+        existing.updated_at = utcnow()
+    # No name content is written to the audit log.
+    db.add(AuditLog(subject_id=principal.subject_id,
+                    event="patient.display_name.shared",
+                    actor=f"patient:{principal.subject_id}", detail={}))
+    db.commit()
+    return {"shared": True}
+
+
+@router.delete("/v1/patients/me/display-name", tags=["patient-auth"])
+def revoke_patient_display_name(
+    principal: PatientPrincipal = Depends(require_patient),
+    db: Session = Depends(get_session),
+):
+    existing = db.get(PatientDisplayName, principal.subject_id)
+    if existing is not None:
+        db.delete(existing)
+    db.add(AuditLog(subject_id=principal.subject_id,
+                    event="patient.display_name.revoked",
+                    actor=f"patient:{principal.subject_id}", detail={}))
+    db.commit()
+    return {"shared": False}
 
 
 class EmptyBody(BaseModel):

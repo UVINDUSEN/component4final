@@ -19,11 +19,12 @@ def test_upgrade_existing_forecasts_is_versioned_idempotent_and_preserves_rows(t
     run_migrations(engine)
     inspector = inspect(engine)
     assert "patient_credentials" in inspector.get_table_names()
+    assert "patient_display_names" in inspector.get_table_names()
     assert "clinician_assignment_invites" in inspector.get_table_names()
     assert "source_fusion_result_id" in {column["name"] for column in inspector.get_columns("forecast_results")}
     with engine.connect() as conn:
         assert conn.execute(text("SELECT forecast_result_id FROM forecast_results")).scalar_one() == "fcst_old"
-        assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 3
+        assert conn.execute(text("SELECT count(*) FROM schema_migrations")).scalar_one() == 4
 
 
 def test_clean_database_bootstraps_core_schema_before_p0_tables(tmp_path):
@@ -33,4 +34,4 @@ def test_clean_database_bootstraps_core_schema_before_p0_tables(tmp_path):
     assert {"subjects", "subject_aliases", "modality_readings", "fusion_results",
             "clinicians", "clinician_subject_assignments", "patient_credentials",
             "forecast_results", "escalation_episodes", "attention_events",
-            "clinician_assignment_invites"} <= tables
+            "clinician_assignment_invites", "patient_display_names"} <= tables

@@ -35,6 +35,7 @@ from db_models import (AttentionEvent, AuditLog, ClinicianSubjectAssignment, For
 from notifications import router as notifications_router
 from clinician_api import (Principal, require_assignment, router as clinician_router,
                            service_or_clinician)
+from patient_display_names import display_name_key_configured
 from patient_auth import (PatientPrincipal, hash_installation_secret,
                           issue_patient_token, patient_or_service, require_patient,
                           verify_installation_secret)
@@ -1223,8 +1224,8 @@ def readiness():
             "patient": bool(os.getenv("PATIENT_JWT_SECRET"))}
     push_enabled = os.getenv("ENABLE_PUSH_NOTIFICATIONS") == "1"
     push_configured = bool(os.getenv("DEVICE_TOKEN_ENCRYPTION_KEY")) and bool(os.getenv("FCM_PROJECT_ID"))
-    ready = (database == "ready" and revision == "0003_push_registry_outbox"
-             and all(auth.values()) and bool(identity.MRN_PEPPER)
+    ready = (database == "ready" and revision == "0004_encrypted_patient_display_names"
+             and all(auth.values()) and display_name_key_configured() and bool(identity.MRN_PEPPER)
              and bool(os.getenv("BACKEND_API_TOKEN"))
              and (not push_enabled or push_configured))
     return JSONResponse(status_code=200 if ready else 503,
@@ -1232,6 +1233,7 @@ def readiness():
                                  "schema_revision": revision, "auth": auth,
                                  "mrn_pepper_set": bool(identity.MRN_PEPPER),
                                  "service_auth": bool(os.getenv("BACKEND_API_TOKEN")),
+                                 "patient_name_encryption_configured": display_name_key_configured(),
                                  "push": {"enabled": push_enabled, "configured": push_configured}})
 
 

@@ -80,6 +80,20 @@ class Subject(Base):
     aliases: Mapped[list["SubjectAlias"]] = relationship(back_populates="subject")
 
 
+class PatientDisplayName(Base):
+    """Optional, separately encrypted identifying label with patient consent.
+
+    The subjects table and modality/fusion/audit records stay pseudonymous.
+    No plaintext patient name is stored in this table.
+    """
+    __tablename__ = "patient_display_names"
+    subject_id: Mapped[str] = mapped_column(
+        ForeignKey("subjects.subject_id"), primary_key=True)
+    encrypted_name: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow)
+
+
 class SubjectAlias(Base):
     """How each system refers to this subject.
 

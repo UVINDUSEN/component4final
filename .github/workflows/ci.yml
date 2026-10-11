@@ -22,6 +22,7 @@ jobs:
       BACKEND_API_TOKEN: test-only-service-token
       CLINICIAN_JWT_SECRET: test-secret-that-is-long-enough-for-tests
       PATIENT_JWT_SECRET: patient-contract-secret-that-is-long-enough-for-tests
+      PATIENT_DISPLAY_NAME_FERNET_KEY: oGXhVgO2J0ySwMCT09yCsbhvvG_f2smLj-32x_lYGR4=
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -70,6 +71,7 @@ jobs:
       BACKEND_API_TOKEN: test-only-postgres-service-token
       CLINICIAN_JWT_SECRET: test-postgres-clinician-secret-long-enough
       PATIENT_JWT_SECRET: test-postgres-patient-secret-long-enough
+      PATIENT_DISPLAY_NAME_FERNET_KEY: oGXhVgO2J0ySwMCT09yCsbhvvG_f2smLj-32x_lYGR4=
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -137,4 +139,5 @@ jobs:
             -e BACKEND_API_TOKEN=ci-only-internal-token \
             -e CLINICIAN_JWT_SECRET=ci-only-clinician-secret \
             -e PATIENT_JWT_SECRET=ci-only-patient-secret \
+            -e PATIENT_DISPLAY_NAME_FERNET_KEY=oGXhVgO2J0ySwMCT09yCsbhvvG_f2smLj-32x_lYGR4= \
             r26-central-ci sh -c 'python migrate_p0.py && python ci_docker_smoke.py'
