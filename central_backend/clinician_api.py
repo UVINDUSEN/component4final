@@ -469,6 +469,39 @@ def accept_assignment_invite(body: AssignmentInviteRequest,
     return {"clinician_id": principal.clinician_id, "subject_id": invite.subject_id, "active": True}
 
 
+
+@router.delete("/v1/clinicians/me/assignments/{subject_id}", tags=["clinician"])
+def end_my_assignment(subject_id: str,
+                      db: Session = Depends(get_session),
+                      principal: Principal = Depends(require_clinician)):
+    """Revoke only this clinician's access; retain the subject and clinical audit.
+
+    Removing a roster assignment is not patient-record erasure. Open or
+    acknowledged attention events must be resolved before access is revoked.
+    """
+    assignment = db.scalar(select(ClinicianSubjectAssignment).where(
+        ClinicianSubjectAssignment.clinician_id == principal.clinician_id,
+        ClinicianSubjectAssignment.subject_id == subject_id,
+        ClinicianSubjectAssignment.active.is_(True)).with_for_update())
+    if assignment is None:
+        raise HTTPException(404, "active assignment not found")
+
+    unresolved_event = db.scalar(select(AttentionEvent.id).where(
+        AttentionEvent.subject_id == subject_id,
+        AttentionEvent.status.in_(("OPEN", "ACKNOWLEDGED"))).limit(1))
+    if unresolved_event is not None:
+        raise HTTPException(409, "resolve outstanding attention events before ending assignment")
+
+    assignment.active = False
+    assignment.ended_at = utcnow()
+    db.add(AuditLog(subject_id=subject_id, event="assignment.ended",
+                    actor=principal.clinician_id,
+                    detail={"reason": "clinician_requested"}))
+    db.commit()
+    return {"clinician_id": principal.clinician_id,
+            "subject_id": subject_id, "active": False}
+
+
 class ResolveBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     note: Optional[str] = Field(None, max_length=255)

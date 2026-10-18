@@ -101,3 +101,22 @@ require `/ready` HTTP 200 before testing ClinAnx. Enforce distributed
    [PUSH_DELIVERY.md](PUSH_DELIVERY.md) for the notification outbox schema,
    encrypted device-token registration and FCM worker. Enforce distributed
    ingress controls using [deploy/nginx_rate_limits.conf.example](deploy/nginx_rate_limits.conf.example).
+
+
+## Ending a clinician assignment (proposed change)
+
+The proposed authenticated `DELETE /v1/clinicians/me/assignments/{subject_id}`
+ends the **calling clinician's** active assignment and records the acting
+clinician and timestamp in the audit log. It **does not delete** the subject,
+measurements, clinical notes, historical fusion results, or other clinicians'
+assignments. It returns 404 when this clinician has no active assignment, 401
+without a valid clinician session, and 409 if OPEN or ACKNOWLEDGED attention
+events still require resolution. On success it returns a JSON confirmation:
+`{"clinician_id":"DR001","subject_id":"...","active":false}`.
+
+Deploy the backend and verify the new route under `/openapi.json` **before**
+shipping the associated ClinAnx client update. The previous backend responds
+404 to this request. Always use a patient-approved new invitation to relink.
+For records requiring transfer of responsibility, follow the study's clinical
+handoff procedure before ending an assignment. This API must not be described
+as permanent patient-data erasure.

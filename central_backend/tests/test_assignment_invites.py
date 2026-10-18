@@ -90,3 +90,60 @@ def test_separate_valid_invite_reactivates_single_assignment():
         assignments = db.scalars(select(ClinicianSubjectAssignment)).all()
         assert len(assignments) == 1
         assert assignments[0].active
+
+
+def test_clinician_unassign_requires_auth_and_preserves_patient_record():
+    client = TestClient(app)
+    clinician = auth(client)
+    token, _ = issue_patient_token("subject-a")
+    issued = client.post("/v1/patients/me/assignment-invites",
+                         headers={"Authorization": "Bearer " + token}, json={})
+    invitation = issued.json()["invite_code"]
+    accepted = client.post("/v1/clinicians/me/assignments", headers=clinician,
+                           json={"invite_code": invitation})
+    assert accepted.status_code == 200
+
+    endpoint = "/v1/clinicians/me/assignments/subject-a"
+    assert client.delete(endpoint).status_code == 401
+    assert client.delete("/v1/clinicians/me/assignments/subject-b",
+                         headers=clinician).status_code == 404
+    response = client.delete(endpoint, headers=clinician)
+    assert response.status_code == 200
+    assert response.json() == {
+        "clinician_id": "DR001", "subject_id": "subject-a", "active": False
+    }
+    assert client.delete(endpoint, headers=clinician).status_code == 404
+    assert client.get("/v1/clinicians/me/patients", headers=clinician).json()["patients"] == []
+    assert client.get("/v1/patients/subject-a/assessment/latest",
+                      headers=clinician).status_code == 403
+
+    with SessionLocal() as db:
+        assignment = db.scalar(select(ClinicianSubjectAssignment))
+        assert not assignment.active
+        assert assignment.ended_at is not None
+        assert db.get(Subject, "subject-a") is not None
+        audit = db.scalar(select(AuditLog).where(AuditLog.event == "assignment.ended"))
+        assert audit.actor == "DR001" and audit.subject_id == "subject-a"
+
+
+def test_unassign_requires_attention_events_to_be_resolved():
+    client = TestClient(app)
+    clinician = auth(client)
+    with SessionLocal() as db:
+        db.add(ClinicianSubjectAssignment(
+            clinician_id="DR001", subject_id="subject-a"))
+        db.add(AttentionEvent(
+            id="pending-event", subject_id="subject-a",
+            event_type="acute_escalation_forecast", severity="high",
+            reason="test", forecast_horizon=10, status="OPEN",
+            policy_version="test-policy"
+        ))
+        db.commit()
+    endpoint = "/v1/clinicians/me/assignments/subject-a"
+    assert client.delete(endpoint, headers=clinician).status_code == 409
+    with SessionLocal() as db:
+        assert db.scalar(select(ClinicianSubjectAssignment)).active
+        event = db.get(AttentionEvent, "pending-event")
+        event.status = "RESOLVED"
+        db.commit()
+    assert client.delete(endpoint, headers=clinician).status_code == 200
